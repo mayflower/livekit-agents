@@ -135,3 +135,50 @@ async def test_an_output_read_back_from_the_session_survives_tool_filtering() ->
     kept = [item.id for item in chat_ctx.copy(tools=[web_search]).items]
 
     assert kept == ["c", "o"]
+
+
+class _BusySession(FakeRealtimeSession):
+    """A session that is mid-response until told otherwise.
+
+    Stands in for the provider keeping one response in flight — OpenAI answers
+    a second `response.create` with `conversation_already_has_active_response`,
+    and the framework does not retry a reply that gets that.
+    """
+
+    def __init__(self, model: FakeRealtimeModel) -> None:
+        super().__init__(model)
+        self.busy = True
+
+    @property
+    def has_active_generation(self) -> bool:
+        return self.busy
+
+
+async def test_a_reply_waits_for_the_provider_to_finish_its_response() -> None:
+    session = _BusySession(FakeRealtimeModel())
+
+    waiting = asyncio.create_task(session.wait_for_response_slot())
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not waiting.done(), "issued a reply while the provider was generating"
+
+    session.busy = False
+    assert await waiting is True
+
+
+async def test_waiting_for_the_slot_gives_up_rather_than_dropping_the_reply() -> None:
+    """A provider stuck generating must not cost the reply entirely.
+
+    Issuing it and having it refused is recoverable and visible; never issuing
+    it is the silent loss this whole path exists to avoid.
+    """
+    session = _BusySession(FakeRealtimeModel())
+
+    assert await session.wait_for_response_slot(timeout=0.05) is False
+
+
+async def test_a_free_session_does_not_wait() -> None:
+    session = _BusySession(FakeRealtimeModel())
+    session.busy = False
+
+    assert await session.wait_for_response_slot(timeout=0) is True

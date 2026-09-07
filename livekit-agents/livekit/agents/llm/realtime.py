@@ -166,6 +166,10 @@ EventTypes = Literal[
 
 TEvent = TypeVar("TEvent")
 
+# Short enough that waiting for the provider costs less than the round-trip a
+# refused reply would have cost anyway.
+_RESPONSE_SLOT_POLL_INTERVAL = 0.02
+
 
 @dataclass
 class InputTranscriptionCompleted:
@@ -275,6 +279,44 @@ class RealtimeSession(ABC, rtc.EventEmitter[EventTypes | TEvent], Generic[TEvent
         """
         async with self._chat_ctx_write_lock:
             await self.update_chat_ctx(producer(self.chat_ctx))
+
+    @property
+    def has_active_generation(self) -> bool:
+        """Whether the provider is already producing a response.
+
+        Several providers keep exactly one response in flight and reject a
+        second: OpenAI answers `response.create` with
+        `conversation_already_has_active_response`. The framework's own idea of
+        "busy" is its local speech queue, which can be empty while the provider
+        is still generating — so a reply issued on that signal alone is
+        sometimes refused, and a refused reply is not retried.
+
+        Defaults to False, which is how every session behaved before this
+        existed: a session that cannot tell is treated as free.
+        """
+        return False
+
+    async def wait_for_response_slot(self, timeout: float = 10.0) -> bool:
+        """Wait until this session can take a new response. True if it can.
+
+        Polled rather than awaited on an event, because "generating" is a
+        provider-side fact that only some plugins track at all, and none of them
+        expose a future for it. The cost is only paid by a caller that would
+        otherwise have raced, and only while it would have been losing.
+
+        Returning False rather than raising on timeout leaves the decision with
+        the caller: issuing the reply and having it refused is usually better
+        than dropping it silently, which is what refusing to try amounts to.
+        """
+        if not self.has_active_generation:
+            return True
+
+        deadline = time.monotonic() + timeout
+        while self.has_active_generation:
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(_RESPONSE_SLOT_POLL_INTERVAL)
+        return True
 
     @abstractmethod
     async def update_tools(self, tools: list[Tool]) -> None: ...

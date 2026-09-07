@@ -3920,6 +3920,28 @@ class AgentActivity(RecognitionHooks):
                     ori_tools = self._rt_session.tools.flatten()
                     await self._rt_session.update_tools(turn_tools)
 
+            # The local speech queue being empty does not mean the provider is
+            # free: the reply that follows a tool call is issued while the
+            # acknowledgement it triggered may still be generating, and a
+            # provider that keeps one response in flight refuses the second.
+            # That refusal is terminal — the reply is marked done and nothing
+            # retries it — so a finished tool result simply never gets spoken.
+            # Waiting for the slot costs less than the round-trip that refusal
+            # costs, and stays interruptible: a caller who speaks in the
+            # meantime should still cut this reply off.
+            if not speech_handle.interrupted:
+                slot = asyncio.ensure_future(self._rt_session.wait_for_response_slot())
+                await speech_handle.wait_if_not_interrupted([slot])
+                if speech_handle.interrupted:
+                    await utils.aio.cancel_and_wait(slot)
+                    return
+                if not await slot:
+                    logger.warning(
+                        "the provider was still generating when a reply was due%s; "
+                        "issuing it anyway",
+                        " after tool execution" if tool_reply else "",
+                    )
+
             generate_reply_fut = self._rt_session.generate_reply(
                 instructions=instructions or NOT_GIVEN,
                 tool_choice=(model_settings.tool_choice if per_response_tool_choice else NOT_GIVEN),
