@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import weakref
 import contextlib
 import contextvars
 import heapq
@@ -115,6 +116,12 @@ if TYPE_CHECKING:
 _AgentActivityContextVar = contextvars.ContextVar["AgentActivity"]("agents_activity")
 _SpeechHandleContextVar = contextvars.ContextVar["SpeechHandle"]("agents_speech_handle")
 _IdleHoldContextVar = contextvars.ContextVar[bool]("agents_idle_hold", default=False)
+
+# Longer than any single server-VAD turn survives (silence ends the turn), short
+# enough that a lost stop event costs one exchange rather than the call. Only
+# reached when a speech-start is never paired.
+_UNPAIRED_SPEECH_TIMEOUT = 60.0
+_RECONNECT_ARMED_ATTR = "_lk_reconnect_speech_release_armed"
 
 
 def _appending(
@@ -240,6 +247,8 @@ class AgentActivity(RecognitionHooks):
         self._rt_session: llm.RealtimeSession | None = None
         self._realtime_spans: utils.BoundedDict[str, trace.Span] | None = None
         self._audio_recognition: AudioRecognition | None = None
+        # backstop for a realtime speech-start whose stop never arrives
+        self._user_speech_release_timer: asyncio.TimerHandle | None = None
         self._lock = asyncio.Lock()
         # one awaited inline AgentTask may pause this activity at a time
         self._inline_task_lock = asyncio.Lock()
@@ -2086,7 +2095,110 @@ class AgentActivity(RecognitionHooks):
 
         self._interruption_detected = False
 
+    def _mark_user_speaking(self, speaking: bool) -> None:
+        """Record user speech on the signals a realtime turn otherwise leaves unset.
+
+        With the realtime model doing server-side turn detection, ``AgentSession``
+        builds a default VAD but this activity de-wires it, so
+        ``AudioRecognition._speaking`` — fed only by the VAD and STT streams —
+        stays False for the whole call, and ``_user_silence_event`` is never
+        cleared. Two gates read exactly those, and both go inert:
+
+        * ``wait_for_idle(wait_for_user=True)`` returns while the user is
+          talking, so a deferred tool reply is spoken over them;
+        * speech playout authorization waits on ``_user_silence_event`` before
+          starting audio, which is what stops a queued reply talking over a new
+          user turn in the STT pipeline.
+
+        Same guard the callers use: when a client-side VAD is driving, that
+        stream is authoritative and this stays out of the way.
+        """
+        if self.vad is not None and not self.using_default_vad:
+            return
+
+        if speaking:
+            self._user_silence_event.clear()
+        else:
+            self._user_silence_event.set()
+
+        if self._audio_recognition is not None:
+            self._audio_recognition._speaking = speaking
+
+        self._reschedule_user_speech_release(speaking)
+
+    def _reschedule_user_speech_release(self, speaking: bool) -> None:
+        """Arm, or cancel, the backstop that releases a latch nobody closed.
+
+        Owning those signals means owning the latch they form: a speech-start
+        whose matching stop never arrives would mute the agent for the rest of
+        the call, since playout waits on ``_user_silence_event`` and
+        ``_deliver_reply`` waits on an untimed ``wait_for_idle()`` — so a
+        finished tool result is dropped rather than merely delayed. ``_vad_task``
+        guards the same shape in its ``finally``, but that task does not run when
+        the VAD is de-wired.
+
+        The timeout is longer than any single server-VAD turn survives (silence
+        ends the turn) and short enough that a lost stop costs one exchange
+        rather than the call.
+        """
+        handle = self._user_speech_release_timer
+        if handle is not None:
+            handle.cancel()
+            self._user_speech_release_timer = None
+
+        if not speaking:
+            return
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no loop (a test calling the handler directly): nothing to arm
+
+        # weak, so a pending timer cannot keep a closed activity alive
+        ref = weakref.ref(self)
+
+        def _release() -> None:
+            activity = ref()
+            if activity is None:
+                return
+            logger.warning(
+                "no input_speech_stopped within %.0fs of input_speech_started — "
+                "releasing the user-speaking latch so the agent can speak again",
+                _UNPAIRED_SPEECH_TIMEOUT,
+            )
+            activity._mark_user_speaking(False)
+
+        self._user_speech_release_timer = loop.call_later(
+            _UNPAIRED_SPEECH_TIMEOUT, _release
+        )
+
+    def _arm_reconnect_speech_release(self) -> None:
+        """Release the latch when the realtime session reconnects.
+
+        A provider drops the in-flight turn on reconnect — error recovery and
+        routine session rotation alike — and emits ``session_reconnected``
+        without a synthetic ``input_speech_stopped``. That is the known way for
+        a start to go unpaired, and it is cheaper to answer than to wait out
+        :data:`_UNPAIRED_SPEECH_TIMEOUT`. Registered once per session, weakly.
+        """
+        rt_session = self._rt_session
+        if rt_session is None or getattr(rt_session, _RECONNECT_ARMED_ATTR, False):
+            return
+
+        ref = weakref.ref(self)
+
+        def _on_session_reconnected(_ev: Any = None) -> None:
+            activity = ref()
+            if activity is not None:
+                activity._mark_user_speaking(False)
+
+        rt_session.on("session_reconnected", _on_session_reconnected)
+        setattr(rt_session, _RECONNECT_ARMED_ATTR, True)
+
     def _on_input_speech_started(self, _: llm.InputSpeechStartedEvent) -> None:
+        self._arm_reconnect_speech_release()
+        self._mark_user_speaking(True)
+
         if self.vad is None or self.using_default_vad:
             self._session._update_user_state("speaking")
             if self._audio_recognition:
@@ -2106,6 +2218,8 @@ class AgentActivity(RecognitionHooks):
                 )
 
     def _on_input_speech_stopped(self, ev: llm.InputSpeechStoppedEvent) -> None:
+        self._mark_user_speaking(False)
+
         if self.vad is None or self.using_default_vad:
             if self._audio_recognition:
                 self._audio_recognition._on_end_of_speech(
