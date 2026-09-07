@@ -6,7 +6,7 @@ import contextvars
 import heapq
 import json
 import time
-from collections.abc import AsyncGenerator, AsyncIterable, Coroutine, Iterator
+from collections.abc import AsyncGenerator, AsyncIterable, Callable, Coroutine, Iterator, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -116,6 +116,26 @@ if TYPE_CHECKING:
 _AgentActivityContextVar = contextvars.ContextVar["AgentActivity"]("agents_activity")
 _SpeechHandleContextVar = contextvars.ContextVar["SpeechHandle"]("agents_speech_handle")
 _IdleHoldContextVar = contextvars.ContextVar[bool]("agents_idle_hold", default=False)
+
+
+def _appending(
+    items: Sequence[llm.ChatItem],
+) -> Callable[[llm.ChatContext], llm.ChatContext]:
+    """A ``update_chat_ctx_with`` producer that only adds ``items``.
+
+    Appending is defined relative to whatever the conversation holds at the
+    moment of the write, which is the whole reason these callers must not
+    compute their update from a context they read earlier: anything that landed
+    in between would be absent from it, and ``update_chat_ctx`` removes what a
+    submitted context leaves out.
+    """
+
+    def _produce(current: llm.ChatContext) -> llm.ChatContext:
+        chat_ctx = current.copy()
+        chat_ctx.items.extend(items)
+        return chat_ctx
+
+    return _produce
 
 
 async def _aligned_transcript_or_text(
@@ -779,6 +799,39 @@ class AgentActivity(RecognitionHooks):
             update_instructions(
                 chat_ctx, instructions=self._agent.instructions, add_if_missing=True
             )
+
+    async def update_chat_ctx_with(
+        self,
+        producer: Callable[[llm.ChatContext], llm.ChatContext],
+        *,
+        exclude_invalid_function_calls: bool = True,
+    ) -> None:
+        """Update the chat context from a change derived under the write's own lock.
+
+        The same relationship to :meth:`update_chat_ctx` that
+        ``RealtimeSession.update_chat_ctx_with`` has to its own: use it for a
+        change defined relative to what is already there, so a concurrent writer
+        cannot be diffed away by a submission computed from an earlier read.
+
+        For a realtime session the producer therefore runs against the *session's*
+        context rather than the agent's, which mid-turn is behind it.
+        """
+        if self._rt_session is None:
+            await self.update_chat_ctx(
+                producer(self._agent.chat_ctx),
+                exclude_invalid_function_calls=exclude_invalid_function_calls,
+            )
+            return
+
+        def _produce(current: llm.ChatContext) -> llm.ChatContext:
+            chat_ctx = producer(current).copy(
+                tools=self.tools if exclude_invalid_function_calls else NOT_GIVEN
+            )
+            self._agent._chat_ctx = chat_ctx
+            remove_instructions(chat_ctx)
+            return chat_ctx
+
+        await self._rt_session.update_chat_ctx_with(_produce)
 
     def update_options(
         self,
@@ -4069,10 +4122,9 @@ class AgentActivity(RecognitionHooks):
             return
 
         if user_input is not None:
-            chat_ctx = self._rt_session.chat_ctx.copy()
-            msg = chat_ctx.add_message(role="user", content=user_input)
+            msg = llm.ChatMessage(role="user", content=[user_input])
             try:
-                await self._rt_session.update_chat_ctx(chat_ctx)
+                await self._rt_session.update_chat_ctx_with(_appending([msg]))
             except llm.RealtimeError as e:
                 # the push is best-effort (the items were sent; only the ack timed out),
                 # so still generate the reply rather than dropping the whole turn
@@ -4562,7 +4614,13 @@ class AgentActivity(RecognitionHooks):
         # them, or message_outputs entries left in "skipped")
         if speech_handle.interrupted and any_skipped and self.llm.capabilities.mutable_chat_context:
             try:
-                await self._rt_session.update_chat_ctx(self._agent._chat_ctx)
+                # authoritative, unlike the appends above: this one *means* the
+                # removal, so it ignores what the conversation currently holds.
+                # It still goes through update_chat_ctx_with, to serialize with
+                # the appenders rather than race them.
+                await self._rt_session.update_chat_ctx_with(
+                    lambda _current: self._agent._chat_ctx
+                )
             except llm.RealtimeError as e:
                 logger.warning(
                     "failed to sync chat context to remove never-played messages",
@@ -4600,10 +4658,10 @@ class AgentActivity(RecognitionHooks):
                 self._session._tool_items_added(interrupted_fnc_outputs)
 
                 # unlike the pipeline, a realtime model holds the call open server-side
-                chat_ctx = self._rt_session.chat_ctx.copy()
-                chat_ctx.items.extend(interrupted_fnc_outputs)
                 try:
-                    await self._rt_session.update_chat_ctx(chat_ctx)
+                    await self._rt_session.update_chat_ctx_with(
+                        _appending(interrupted_fnc_outputs)
+                    )
                 except llm.RealtimeError as e:
                     logger.warning(
                         "failed to sync the tool results of an interrupted generation",
@@ -4705,10 +4763,10 @@ class AgentActivity(RecognitionHooks):
                     task = asyncio.create_task(_wait_for_auto_tool_reply())
                     run_state._watch_handle(task)
 
-                chat_ctx = self._rt_session.chat_ctx.copy()
-                chat_ctx.items.extend(new_fnc_outputs)
                 try:
-                    await self._rt_session.update_chat_ctx(chat_ctx)
+                    await self._rt_session.update_chat_ctx_with(
+                        _appending(new_fnc_outputs)
+                    )
                 except llm.RealtimeError as e:
                     logger.warning(
                         "failed to update chat context before generating the function calls results",  # noqa: E501

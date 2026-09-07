@@ -522,6 +522,17 @@ class ChatContext:
                     continue
 
         valid_tools = set(get_tool_names(tools)) if tools else set()
+        # An output belongs to its call, and only the call reliably carries a
+        # name: a provider's wire format for a function *output* generally has
+        # no name field, so an output read back from a realtime session has
+        # lost it (`openai_item_to_livekit_item` builds one without). Judging
+        # such an output by its own name drops every result the model has
+        # already been told — which is a lost tool result, not a filtered one.
+        kept_calls = {
+            item.call_id
+            for item in self.items
+            if item.type == "function_call" and item.name in valid_tools
+        }
         for item in self.items:
             if exclude_function_call and item.type in [
                 "function_call",
@@ -549,6 +560,9 @@ class ChatContext:
                 is_given(tools)
                 and (item.type == "function_call" or item.type == "function_call_output")
                 and item.name not in valid_tools
+                and not (
+                    item.type == "function_call_output" and item.call_id in kept_calls
+                )
             ):
                 continue
 

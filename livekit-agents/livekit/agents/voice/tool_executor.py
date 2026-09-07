@@ -133,6 +133,17 @@ class ToolHandlingOptions(TypedDict, total=False):
     handling, coalesced replies). Unmentioned keys keep their defaults."""
 
 
+def _inserting(items: list[ChatItem]) -> Callable[[ChatContext], ChatContext]:
+    """A ``update_chat_ctx_with`` producer that only inserts ``items``."""
+
+    def _produce(current: ChatContext) -> ChatContext:
+        chat_ctx = current.copy()
+        chat_ctx.insert(items)
+        return chat_ctx
+
+    return _produce
+
+
 def _render(template: str | Callable[[Any], str], args: dict[str, Any]) -> str:
     """Render a template: callables receive ``args``; strings use ``str.format(**args)``."""
     if callable(template):
@@ -523,9 +534,13 @@ class _ToolExecutor:
             if self._owning_activity is not None
             else ctx.session.current_agent
         )
-        chat_ctx = target.chat_ctx.copy()
-        chat_ctx.insert(items)
-        await target.update_chat_ctx(chat_ctx)
+        # Derived under the write's own lock rather than from a context read
+        # here: a realtime conversation has other writers — the turn that
+        # dispatched the tool syncs the whole thing too — and a submission
+        # computed from an earlier read both loses to them and deletes whatever
+        # it is missing. Mid-turn the agent's own copy is missing plenty, since
+        # an assistant message is recorded only once its audio has played.
+        await target.update_chat_ctx_with(_inserting(items))
         ctx.session.history.insert(items)
 
         self._pending_updates.append(_PendingUpdate(ctx=ctx, items=items, target=target))
