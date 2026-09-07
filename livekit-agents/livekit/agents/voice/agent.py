@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncGenerator, AsyncIterable, Coroutine, Generator
+from collections.abc import AsyncGenerator, AsyncIterable, Callable, Coroutine, Generator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
 
@@ -259,6 +259,40 @@ class Agent:
 
         await self._activity.update_chat_ctx(
             chat_ctx, exclude_invalid_function_calls=exclude_invalid_function_calls
+        )
+
+    async def update_chat_ctx_with(
+        self,
+        producer: Callable[[llm.ChatContext], llm.ChatContext],
+        *,
+        exclude_invalid_function_calls: bool = True,
+    ) -> None:
+        """
+        Updates the agent's chat context from a change derived under the write's lock.
+
+        The same relationship to :meth:`update_chat_ctx` that
+        ``RealtimeSession.update_chat_ctx_with`` has to its own: use it for a
+        change defined relative to what is already there — an append, an insert —
+        so that a writer landing between the read and the write is not removed by
+        a submission that predates it.
+
+        Args:
+            producer: Receives the chat context as it is at the moment of the
+                write and returns the one to store.
+            exclude_invalid_function_calls (bool): Whether to exclude function calls
+                and outputs not from the agent's tools.
+
+        Raises:
+            llm.RealtimeError: If updating the realtime session chat context fails.
+        """
+        if self._activity is None:
+            self._chat_ctx = producer(self._chat_ctx).copy(
+                tools=self._tools if exclude_invalid_function_calls else NOT_GIVEN
+            )
+            return
+
+        await self._activity.update_chat_ctx_with(
+            producer, exclude_invalid_function_calls=exclude_invalid_function_calls
         )
 
     def update_options(

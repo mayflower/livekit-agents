@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterable, Awaitable
+from collections.abc import AsyncIterable, Awaitable, Callable
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Generic, Literal, TypeVar
@@ -200,6 +200,7 @@ class RealtimeSession(ABC, rtc.EventEmitter[EventTypes | TEvent], Generic[TEvent
     def __init__(self, realtime_model: RealtimeModel) -> None:
         super().__init__()
         self._realtime_model = realtime_model
+        self._chat_ctx_write_lock = asyncio.Lock()
 
     def _report_connection_acquired(self, acquire_time: float) -> None:
         """Report connection timing as a RealtimeModelMetrics event with zero usage."""
@@ -249,6 +250,31 @@ class RealtimeSession(ABC, rtc.EventEmitter[EventTypes | TEvent], Generic[TEvent
     async def update_chat_ctx(
         self, chat_ctx: ChatContext
     ) -> None: ...  # can raise RealtimeError on Timeout
+
+    async def update_chat_ctx_with(
+        self, producer: Callable[[ChatContext], ChatContext]
+    ) -> None:
+        """Apply a change derived from the session's current chat context, atomically.
+
+        ``update_chat_ctx`` is declarative: it takes the whole conversation and
+        removes whatever the caller left out. Callers therefore read the current
+        context, add their own items and submit the result — and any writer that
+        lands between that read and the write is diffed away as though its items
+        had been asked for removal. Nobody intends that: the appending callers
+        only ever add, and the deletions are an artifact of expressing "append"
+        as "set the whole state" against a base that has since moved.
+
+        ``producer`` is called with the context as it is *at the moment of the
+        write*, under the same lock that guards the write, so a concurrent append
+        cannot be lost. Use this for any change defined relative to what is
+        already there; ``update_chat_ctx`` remains right for a caller that
+        genuinely means "make it exactly this", such as removing items the user
+        never heard.
+
+        Raises whatever ``update_chat_ctx`` raises, ``RealtimeError`` included.
+        """
+        async with self._chat_ctx_write_lock:
+            await self.update_chat_ctx(producer(self.chat_ctx))
 
     @abstractmethod
     async def update_tools(self, tools: list[Tool]) -> None: ...

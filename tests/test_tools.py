@@ -2009,6 +2009,7 @@ def _make_reply_session(speech: Any) -> Any:
     agent = MagicMock()
     agent.chat_ctx = ChatContext.empty()
     agent.update_chat_ctx = AsyncMock()
+    agent.update_chat_ctx_with = AsyncMock()
     session.current_agent = agent
     session._global_run_state = None
     activity = MagicMock()
