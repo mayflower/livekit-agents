@@ -62,7 +62,7 @@ and GitHub suspends scheduled workflows after 60 days without repository activit
 
 ## What is patched
 
-Two commits, both against one defect class: **a finished tool result never
+Four commits, all against one defect class: **a finished tool result never
 reaching the caller.** Read this before porting them to a new release — a clean
 `git rebase` says the text still applies, not that the reasoning does.
 
@@ -127,6 +127,55 @@ visible while an unissued one is silent.
 *Porting checks:* is the refusal still terminal upstream (is the `TODO` still
 there)? Has `has_active_generation` moved to the base or gained a real event? If
 upstream adds a retry or an await, prefer theirs and drop this.
+
+### 3. A realtime turn never records that the user is speaking
+
+*Files: `voice/agent_activity.py`*
+
+`AgentSession` builds a default VAD, but `AgentActivity` de-wires it when the
+model does its own turn taking — so `AudioRecognition._speaking`, fed only by the
+VAD and STT streams, stays False for the whole call, and `_user_silence_event` is
+never cleared. `_on_input_speech_started` updates `user_state` and calls
+`_on_start_of_speech`, but that helper sets neither.
+
+Two gates read exactly those two and both go inert:
+`wait_for_idle(wait_for_user=True)` returns while the caller is mid-sentence, so
+a deferred tool reply is spoken over them; and playout authorization waits on
+`_user_silence_event`, which is what stops a queued reply talking over a new user
+turn in the STT pipeline.
+
+The handlers now set both, behind the guard they already use for the rest of
+their bodies. Owning the signals means owning the latch: a start whose stop never
+arrives would mute the agent for the rest of the call, so there are two backstops
+— `session_reconnected`, and a timeout for anything else.
+
+*Porting checks:* does `AgentActivity` still de-wire the VAD for realtime turn
+detection? Is `AudioRecognition._speaking` still a settable property, and does
+`_on_start_of_speech` still leave it alone? Do the two gates still read these
+signals? If upstream starts feeding them itself, drop this.
+
+### 4. A reply that cannot even be requested is invisible
+
+*Files: `voice/tool_executor.py`*
+
+`_deliver_reply` calls `session.generate_reply(...)` with no `try`, and
+`_create_speech_task` attaches no error handler — so a raise there surfaces only
+as asyncio's "Task exception was never retrieved", which structured logging does
+not show. `_pending_updates` is already cleared, so there is nothing to retry
+with.
+
+Every in-tree plugin reports failure through the returned future, where
+`AgentActivity` catches it, which is why upstream has never felt this. An
+out-of-tree plugin that raised synchronously cost two finished tool calls in one
+call, silently.
+
+The results survive regardless — `_enqueue_reply` puts them in the chat context
+first — so what the log names is which calls the caller did not hear. It
+deliberately does not retry: a retry competes for the same floor as the next
+acknowledgement and loses.
+
+*Porting check:* is the call still unguarded, and does `_create_speech_task`
+still attach no handler? If upstream adds either, drop this.
 
 ## Verifying a port
 
