@@ -62,7 +62,84 @@ and GitHub suspends scheduled workflows after 60 days without repository activit
 
 ## What is patched
 
-See the commits on the patch branch. Each is written to be cherry-picked into an
-upstream PR unchanged — which is the whole point of keeping the version marker
-(`<version>+mayflower.1`) on `build/*` instead. That marker exists so a running
-worker's log names which build it is; the lock file records the exact rev anyway.
+Two commits, both against one defect class: **a finished tool result never
+reaching the caller.** Read this before porting them to a new release — a clean
+`git rebase` says the text still applies, not that the reasoning does.
+
+### 1. Concurrent chat-context writers lose each other's items
+
+*Files: `llm/realtime.py`, `voice/agent.py`, `voice/agent_activity.py`,
+`voice/tool_executor.py`, `llm/chat_context.py`*
+
+`RealtimeSession.update_chat_ctx(ctx)` is declarative: the caller submits the
+whole conversation and the session removes whatever the submission leaves out.
+Callers that only want to *add* something therefore read the current context,
+append, and submit — and anything that lands between that read and the write is
+deleted as though its removal had been requested. The plugin's own
+`_update_chat_ctx_lock` cannot prevent it: it covers the write, not the read.
+
+It costs a finished async tool its result. `_ToolExecutor._enqueue_reply` writes
+the synthetic `{call_id}_final` pair, and the turn that dispatched the tool then
+re-syncs the whole conversation from a snapshot taken before that write landed.
+
+The fix adds `update_chat_ctx_with(producer)` at three levels —
+`RealtimeSession`, `AgentActivity`, `Agent` — running the producer under the
+same lock as the write, and converts the four framework writers to it.
+`update_chat_ctx` keeps its declarative meaning for the one caller that means
+"make it exactly this" (the never-played-item cleanup), which now goes through a
+producer that ignores the current context so it serialises rather than races.
+
+It also carries a second, subtler half. A provider's wire format for a function
+*output* has no name field, so an output read back from a session has lost it
+(`openai_item_to_livekit_item` rebuilds one without). `ChatContext.copy(tools=…)`
+judged an output by that name and dropped it as foreign — so any update derived
+from the session's context was missing every earlier result. An output is now
+judged by its call. **Do not drop this half when porting**: deriving the update
+from the session is what makes the first half work, and it is exactly what
+exposes the name loss.
+
+*Porting checks:* does `update_chat_ctx` still remove what a submission omits?
+Do the four writers still read the context themselves? Does
+`openai_item_to_livekit_item` still build a `FunctionCallOutput` without a
+`name`? If any answer is no, the upstream shape has changed — re-read before
+carrying the commit.
+
+### 2. A reply is issued while the provider is still generating
+
+*Files: `llm/realtime.py`, `voice/agent_activity.py`*
+
+Several providers keep one response in flight and refuse a second; OpenAI
+answers `response.create` with `conversation_already_has_active_response`. The
+reply that speaks a finished tool result is issued when the framework's *local*
+speech queue is empty, which says nothing about the provider — so it races the
+acknowledgement the same tool triggered, and loses.
+
+Losing is terminal: `_realtime_reply_task` logs, marks the speech done and
+returns, and `_deliver_reply` has already cleared its pending updates. Upstream
+leaves a `TODO(long): reschedule interrupted replies?` where a retry would go.
+
+`has_active_generation` already existed on the OpenAI plugin; the fix lifts it to
+the base with a `False` default (so a plugin that cannot tell keeps today's
+behaviour), adds `wait_for_response_slot`, and waits before issuing —
+interruptibly, and giving up rather than raising, because a refused reply is
+visible while an unissued one is silent.
+
+*Porting checks:* is the refusal still terminal upstream (is the `TODO` still
+there)? Has `has_active_generation` moved to the base or gained a real event? If
+upstream adds a retry or an await, prefer theirs and drop this.
+
+## Verifying a port
+
+A clean rebase is not a passing test.
+
+1. `uv sync --all-extras --dev && uv run pytest -p no:randomly --unit` here.
+   Compare the failures against the same command on the *pristine* release tag —
+   about a dozen fail either way because they need a LiveKit server or network
+   access. What matters is that the two sets are identical.
+   `tests/test_realtime_chat_ctx_atomicity.py` is this fork's own and must pass.
+2. In `voice-demo-solution`: `lib/framework_patches.py` hashes the source of every
+   framework function it wraps, so a bump that touches one fails loudly. Re-read
+   the upstream source before re-recording a hash.
+3. `e2e-tests/tests/realtime-tool-result-retained.test.ts` drives a real realtime
+   session and is the only test that exercises both fixes together. It is written
+   to fail without them; its header says how that was checked.
