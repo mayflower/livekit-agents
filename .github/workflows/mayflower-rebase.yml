@@ -4,8 +4,10 @@
 # This file lives on the default branch on purpose: GitHub only fires
 # `schedule:` for workflows on the default branch, and keeping it here is also
 # what keeps it out of `mayflower/*`. Those branches stay exactly one upstream
-# release tag plus our commits, so a PR opened from one against livekit/agents
-# carries the fix and nothing else.
+# release tag plus the fixes, so a PR opened from one against livekit/agents
+# carries the fix and nothing else — which is why the local version marker is
+# not on them either. It goes on `build/<version>`, cut from the patch branch,
+# and that is what voice-demo-solution pins.
 name: Rebase onto the newest upstream release
 
 on:
@@ -85,26 +87,24 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # The version marker is dropped and rewritten rather than rebased. It
-          # edits version.py, which every upstream release also bumps, so
-          # carrying it across would conflict on every single run — on the one
-          # commit that means nothing. Only the fixes are actually rebased, and
-          # a conflict then says something real.
-          marker='chore: mark this build as the mayflower fork of '
-          tip=$(git log -1 --format=%s "origin/${{ steps.plan.outputs.current }}")
-          case "$tip" in
-            "$marker"*) ;;
-            *) echo "::error::expected the version marker at the tip of ${{ steps.plan.outputs.current }}, found: $tip"; exit 1 ;;
-          esac
-
-          git checkout -B "${{ steps.plan.outputs.target }}" "origin/${{ steps.plan.outputs.current }}^"
+          git checkout -B "${{ steps.plan.outputs.target }}" "origin/${{ steps.plan.outputs.current }}"
           git rebase --onto "${{ steps.plan.outputs.to_tag }}" "${{ steps.plan.outputs.from_tag }}"
+          git push --force-with-lease origin "${{ steps.plan.outputs.target }}"
 
+          # The build branch is the patch branch plus the local version marker,
+          # which exists so a running worker's log names which build it is. It
+          # is written fresh rather than rebased: it edits version.py, which
+          # every release also bumps, so carrying it across would conflict on
+          # every run — and it must stay off the patch branch, which is what
+          # upstream PRs are opened from.
+          build="build/${{ steps.plan.outputs.to_version }}"
+          git checkout -B "$build" "${{ steps.plan.outputs.target }}"
           version_file=livekit-agents/livekit/agents/version.py
           sed -i "s/^__version__ = \".*\"$/__version__ = \"${{ steps.plan.outputs.to_version }}+mayflower.1\"/" "$version_file"
-          git commit -q -m "${marker}${{ steps.plan.outputs.to_version }}" "$version_file"
+          git commit -q -m "chore: mark this build as the mayflower fork of ${{ steps.plan.outputs.to_version }}" "$version_file"
+          git push --force-with-lease origin "$build"
 
-          git push --force-with-lease origin "${{ steps.plan.outputs.target }}"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Say what happened
@@ -119,9 +119,11 @@ jobs:
           if [ '${{ steps.rebase.outcome }}' = 'success' ]; then
             title="Rebased onto ${to_tag}"
             body=$(cat <<EOF
-          \`${target}\` is pushed, rebased cleanly from \`${{ steps.plan.outputs.from_tag }}\`.
+          \`${target}\` is pushed, rebased cleanly from \`${{ steps.plan.outputs.from_tag }}\`,
+          and \`${{ steps.rebase.outputs.build }}\` on top of it carries the version marker.
 
-          Pin it in \`voice-demo-solution\` (\`livekit-agent/pyproject.toml\`, \`[tool.uv.sources]\`):
+          Pin the build branch in \`voice-demo-solution\` (\`livekit-agent/pyproject.toml\`,
+          \`[tool.uv.sources]\`):
 
           \`\`\`
           rev = "${{ steps.rebase.outputs.sha }}"
