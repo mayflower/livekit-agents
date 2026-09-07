@@ -1,0 +1,154 @@
+# Keeps the patch branch sitting on an upstream *release tag* rather than
+# drifting onto whatever main happens to be.
+#
+# This file lives on the default branch on purpose: GitHub only fires
+# `schedule:` for workflows on the default branch, and keeping it here is also
+# what keeps it out of `mayflower/*`. Those branches stay exactly one upstream
+# release tag plus our commits, so a PR opened from one against livekit/agents
+# carries the fix and nothing else.
+name: Rebase onto the newest upstream release
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays, a little after the hour
+  workflow_dispatch:
+    inputs:
+      target_tag:
+        description: "Upstream tag to rebase onto (default: the newest release)"
+        required: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream tags
+        run: |
+          git remote add upstream https://github.com/livekit/agents.git
+          git fetch --quiet upstream --tags
+
+      - name: Work out what to rebase, and onto what
+        id: plan
+        run: |
+          set -euo pipefail
+
+          # The branch naming carries the base: mayflower/<version> is patched
+          # onto livekit-agents@<version>. Newest such branch is the live one.
+          current=$(git for-each-ref --format='%(refname:strip=3)' 'refs/remotes/origin/mayflower/*' \
+            | sort -V | tail -1)
+          if [ -z "$current" ]; then
+            echo "no mayflower/* branch to rebase" >&2
+            exit 1
+          fi
+          from_version=${current#mayflower/}
+
+          if [ -n "${{ inputs.target_tag }}" ]; then
+            latest="${{ inputs.target_tag }}"
+          else
+            # Releases only — a pre-release (…rc1) is not something to sit on.
+            latest=$(git tag --list 'livekit-agents@*' \
+              | grep -E '^livekit-agents@[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sed 's/^livekit-agents@//' | sort -V | tail -1)
+            latest="livekit-agents@${latest}"
+          fi
+          to_version=${latest#livekit-agents@}
+
+          {
+            echo "current=$current"
+            echo "from_tag=livekit-agents@${from_version}"
+            echo "to_tag=$latest"
+            echo "to_version=$to_version"
+            echo "target=mayflower/${to_version}"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$from_version" = "$to_version" ]; then
+            echo "uptodate=true" >> "$GITHUB_OUTPUT"
+            echo "Already on the newest release ($latest)."
+          else
+            echo "uptodate=false" >> "$GITHUB_OUTPUT"
+            echo "Rebasing $current from $from_version onto $to_version."
+          fi
+
+      - name: Rebase the patch branch
+        id: rebase
+        if: steps.plan.outputs.uptodate == 'false'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # The version marker is dropped and rewritten rather than rebased. It
+          # edits version.py, which every upstream release also bumps, so
+          # carrying it across would conflict on every single run — on the one
+          # commit that means nothing. Only the fixes are actually rebased, and
+          # a conflict then says something real.
+          marker='chore: mark this build as the mayflower fork of '
+          tip=$(git log -1 --format=%s "origin/${{ steps.plan.outputs.current }}")
+          case "$tip" in
+            "$marker"*) ;;
+            *) echo "::error::expected the version marker at the tip of ${{ steps.plan.outputs.current }}, found: $tip"; exit 1 ;;
+          esac
+
+          git checkout -B "${{ steps.plan.outputs.target }}" "origin/${{ steps.plan.outputs.current }}^"
+          git rebase --onto "${{ steps.plan.outputs.to_tag }}" "${{ steps.plan.outputs.from_tag }}"
+
+          version_file=livekit-agents/livekit/agents/version.py
+          sed -i "s/^__version__ = \".*\"$/__version__ = \"${{ steps.plan.outputs.to_version }}+mayflower.1\"/" "$version_file"
+          git commit -q -m "${marker}${{ steps.plan.outputs.to_version }}" "$version_file"
+
+          git push --force-with-lease origin "${{ steps.plan.outputs.target }}"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Say what happened
+        if: steps.plan.outputs.uptodate == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          target='${{ steps.plan.outputs.target }}'
+          to_tag='${{ steps.plan.outputs.to_tag }}'
+
+          if [ '${{ steps.rebase.outcome }}' = 'success' ]; then
+            title="Rebased onto ${to_tag}"
+            body=$(cat <<EOF
+          \`${target}\` is pushed, rebased cleanly from \`${{ steps.plan.outputs.from_tag }}\`.
+
+          Pin it in \`voice-demo-solution\` (\`livekit-agent/pyproject.toml\`, \`[tool.uv.sources]\`):
+
+          \`\`\`
+          rev = "${{ steps.rebase.outputs.sha }}"
+          \`\`\`
+
+          A clean rebase is not a passing test. Before pinning, check that the
+          functions \`lib/framework_patches.py\` wraps still hash the same, and run
+          both suites — upstream's \`--unit\` here and the agent's over there.
+          EOF
+          )
+          else
+            title="Rebase onto ${to_tag} conflicts"
+            body=$(cat <<EOF
+          \`git rebase --onto ${to_tag} ${{ steps.plan.outputs.from_tag }} ${{ steps.plan.outputs.current }}\`
+          did not apply, so nothing was pushed. Upstream has changed code the fix
+          touches, which is worth reading before resolving: the fix may have landed,
+          in which case the patch is deleted rather than carried.
+
+          [Run log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          EOF
+          )
+          fi
+
+          # One open issue per target, so a weekly schedule does not pile up.
+          existing=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            echo "Already reported in #${existing}."
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
