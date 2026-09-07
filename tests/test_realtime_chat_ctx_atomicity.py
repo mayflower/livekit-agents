@@ -182,3 +182,99 @@ async def test_a_free_session_does_not_wait() -> None:
     session.busy = False
 
     assert await session.wait_for_response_slot(timeout=0) is True
+
+
+# --- the signals a realtime turn leaves unset, and the reply nobody reports ---
+
+
+async def test_realtime_speech_marks_the_user_as_speaking() -> None:
+    """The gates that hold a reply back read these, and a realtime turn set neither.
+
+    `AgentSession` builds a default VAD but the activity de-wires it when the
+    model does its own turn taking, so `AudioRecognition._speaking` stays False
+    for the whole call and `_user_silence_event` is never cleared — and a
+    deferred tool reply is then spoken over a talking caller.
+    """
+    from livekit.agents.llm import InputSpeechStartedEvent, InputSpeechStoppedEvent
+
+    activity = _speech_signal_activity()
+
+    activity._on_input_speech_started(InputSpeechStartedEvent())
+    assert not activity._user_silence_event.is_set()
+    assert activity._audio_recognition._speaking is True
+
+    activity._on_input_speech_stopped(
+        InputSpeechStoppedEvent(user_transcription_enabled=False)
+    )
+    assert activity._user_silence_event.is_set()
+    assert activity._audio_recognition._speaking is False
+
+
+async def test_an_unpaired_speech_start_releases_itself() -> None:
+    """Owning the latch means owning its failure mode.
+
+    A start whose stop never arrives would mute the agent for the rest of the
+    call: playout waits on `_user_silence_event` and `_deliver_reply` waits on
+    an untimed `wait_for_idle()`. `_vad_task` guards the same shape in its
+    `finally`, but it does not run when the VAD is de-wired.
+    """
+    from livekit.agents.voice import agent_activity as aa
+    from livekit.agents.llm import InputSpeechStartedEvent
+
+    activity = _speech_signal_activity()
+    original = aa._UNPAIRED_SPEECH_TIMEOUT
+    aa._UNPAIRED_SPEECH_TIMEOUT = 0.02
+    try:
+        activity._on_input_speech_started(InputSpeechStartedEvent())
+        assert not activity._user_silence_event.is_set()
+        await asyncio.sleep(0.05)
+    finally:
+        aa._UNPAIRED_SPEECH_TIMEOUT = original
+
+    assert activity._user_silence_event.is_set()
+    assert activity._audio_recognition._speaking is False
+
+
+async def test_a_client_vad_keeps_ownership_of_the_signals() -> None:
+    """When a real VAD is driving, its stream is authoritative and this stays out."""
+    from livekit.agents.llm import InputSpeechStartedEvent
+
+    from .fake_vad import FakeVAD
+
+    activity = _speech_signal_activity()
+    # a VAD set on the agent, which is what makes it client-side rather than
+    # the session's default
+    activity._agent._vad = FakeVAD()
+    activity._user_silence_event.set()
+
+    activity._on_input_speech_started(InputSpeechStartedEvent())
+
+    assert activity._user_silence_event.is_set()
+
+
+def _speech_signal_activity() -> Any:
+    """A real activity in the production shape: realtime turn detection, VAD de-wired.
+
+    Built rather than stubbed, because what is being tested is which of the
+    framework's own signals a realtime turn leaves untouched — a hand-made
+    object would only prove the test agrees with itself.
+    """
+    from livekit.agents import Agent, AgentSession
+    from livekit.agents.voice.agent_activity import AgentActivity
+    from livekit.agents.voice.audio_recognition import AudioRecognition
+    from livekit.agents.voice.endpointing import BaseEndpointing
+
+    session = AgentSession(llm=FakeRealtimeModel())
+    agent = Agent(instructions="test")
+    activity = AgentActivity(agent, session)
+    agent._activity = activity
+    activity._audio_recognition = AudioRecognition(
+        session,
+        hooks=activity,
+        endpointing=BaseEndpointing(min_delay=0.4, max_delay=6.0),
+        stt=None,
+        vad=None,
+        interruption_detection=None,
+        turn_detection=None,
+    )
+    return activity
