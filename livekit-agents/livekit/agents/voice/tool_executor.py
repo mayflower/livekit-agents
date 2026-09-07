@@ -609,11 +609,30 @@ class _ToolExecutor:
         )
 
         call_ids = [item.call_id for item in pending_items if item.type == "function_call_output"]
-        speech = session.generate_reply(
-            instructions=_render(template, {"call_ids": call_ids}),
-            tool_choice="none",
-            chat_ctx=chat_ctx,
-        )
+        try:
+            speech = session.generate_reply(
+                instructions=_render(template, {"call_ids": call_ids}),
+                tool_choice="none",
+                chat_ctx=chat_ctx,
+            )
+        except Exception:
+            # `_pending_updates` was cleared above, so there is nothing left to
+            # retry with and nothing else reports this: the request is made from
+            # a bare task, and `_create_speech_task` attaches no error handler,
+            # so a raise here surfaces only as asyncio's "Task exception was
+            # never retrieved" — which structured logging does not show at all.
+            # A plugin that reports failure through the returned future instead
+            # never reaches this, which is why it went unnoticed.
+            #
+            # The results themselves survive: `_enqueue_reply` put them in the
+            # chat context before any of this. What is lost is the caller
+            # hearing them, and this says which.
+            logger.exception(
+                "the reply for a finished tool result could not be requested — "
+                "the caller did not hear it, though the result is in the chat context",
+                extra={"call_ids": call_ids},
+            )
+            return
         session._tool_execution_updated(
             ToolExecutionUpdatedEvent(
                 update=ToolReplyUpdated(
