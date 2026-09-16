@@ -1,0 +1,23 @@
+name: Probe issue creation with GITHUB_TOKEN
+on:
+  workflow_dispatch:
+permissions:
+  issues: write
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - run: gh --version
+      - name: REST blank title
+        run: gh api "repos/${GITHUB_REPOSITORY}/issues" -X POST -f title="" || true
+      - name: GraphQL blank title
+        run: |
+          rid=$(gh api graphql -f query='{repository(owner:"mayflower",name:"livekit-agents"){id}}' --jq .data.repository.id)
+          gh api graphql -f query="mutation{createIssue(input:{repositoryId:\"$rid\",title:\"\"}){issue{number}}}" || true
+      - name: gh issue list
+        run: gh issue list --state open --json number || true
+      - name: Token scopes
+        run: gh api repos/${GITHUB_REPOSITORY} --jq '.permissions' || true
