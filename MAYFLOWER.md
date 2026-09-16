@@ -53,9 +53,9 @@ git checkout -B build/<new> mayflower/<new>
 # set __version__ to "<new>+mayflower.1", commit, and pin that rev
 ```
 
-A clean rebase is not a passing test. `voice-demo-solution` hashes the source of
-every framework function it wraps (`lib/framework_patches.py`), so check those and
-run both suites before pinning.
+A clean rebase is not a passing test. Run upstream's unit suite here against the
+pristine tag and the rebased branch, then `voice-demo-solution`'s agent suite, as
+described under "Verifying a port" below.
 
 Two things about Actions on a fork: they are disabled until someone enables them,
 and GitHub suspends scheduled workflows after 60 days without repository activity.
@@ -186,9 +186,10 @@ A clean rebase is not a passing test.
    about a dozen fail either way because they need a LiveKit server or network
    access. What matters is that the two sets are identical.
    `tests/test_realtime_chat_ctx_atomicity.py` is this fork's own and must pass.
-2. In `voice-demo-solution`: `lib/framework_patches.py` hashes the source of every
-   framework function it wraps, so a bump that touches one fails loudly. Re-read
-   the upstream source before re-recording a hash.
+2. In `voice-demo-solution`: pin the new rev, `uv lock`, and run the agent suite
+   (`cd livekit-agent && uv run --group test pytest`). Nothing there guards the
+   framework's source any more, so re-read "What is patched" against the new
+   release rather than trusting a green rebase.
 3. `e2e-tests/tests/realtime-tool-result-retained.test.ts` drives a real realtime
    session and is the only test that exercises both fixes together. It is written
    to fail without them; its header says how that was checked.

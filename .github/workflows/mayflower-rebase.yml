@@ -129,9 +129,9 @@ jobs:
           rev = "${{ steps.rebase.outputs.sha }}"
           \`\`\`
 
-          A clean rebase is not a passing test. Before pinning, check that the
-          functions \`lib/framework_patches.py\` wraps still hash the same, and run
-          both suites — upstream's \`--unit\` here and the agent's over there.
+          A clean rebase is not a passing test. Before pinning, follow "Verifying a
+          port" in \`MAYFLOWER.md\`: upstream's \`--unit\` suite here against both the
+          pristine tag and the rebased branch, then the agent's suite over there.
           EOF
           )
           else
