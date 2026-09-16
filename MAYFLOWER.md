@@ -57,8 +57,11 @@ A clean rebase is not a passing test. Run upstream's unit suite here against the
 pristine tag and the rebased branch, then `voice-demo-solution`'s agent suite, as
 described under "Verifying a port" below.
 
-Two things about Actions on a fork: they are disabled until someone enables them,
-and GitHub suspends scheduled workflows after 60 days without repository activity.
+Three things about a fork: Actions are disabled until someone enables them, GitHub
+suspends scheduled workflows after 60 days without repository activity, and Issues
+are off by default — the workflow reports through them, so `gh issue create` fails
+with "Resource not accessible by integration" until they are switched on in the
+repository settings.
 
 ## What is patched
 
