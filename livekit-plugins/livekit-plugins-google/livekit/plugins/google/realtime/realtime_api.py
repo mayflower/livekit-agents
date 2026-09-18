@@ -763,7 +763,15 @@ class RealtimeSession(llm.RealtimeSession):
         if self._tools == tool_ctx:
             return
 
+        # ToolContext compares by object identity, and a decorated method is a
+        # fresh object on every attribute access — so an agent that assembles its
+        # tool list per push reconnects for a set the API cannot tell apart.
+        previous_config = self._build_tools_config()
         self._tools = tool_ctx
+        if previous_config == self._build_tools_config():
+            # adopted anyway: the new objects carry the handlers the caller wants run
+            return
+
         self._mark_restart_needed()
 
     @property
@@ -1246,14 +1254,18 @@ class RealtimeSession(llm.RealtimeSession):
         finally:
             self._mark_current_generation_done()
 
-    def _build_connect_config(self) -> types.LiveConnectConfig:
-        temp = self._opts.temperature if is_given(self._opts.temperature) else None
-
+    def _build_tools_config(self) -> list[types.Tool]:
         tools_config, _ = create_tools_config(
             self._tools,
             tool_behavior=self._opts.tool_behavior,
             use_parameters_json_schema=False,
         )
+        return tools_config
+
+    def _build_connect_config(self) -> types.LiveConnectConfig:
+        temp = self._opts.temperature if is_given(self._opts.temperature) else None
+
+        tools_config = self._build_tools_config()
         conf = types.LiveConnectConfig(
             response_modalities=self._opts.response_modalities,
             history_config=types.HistoryConfig(initial_history_in_client_content=True)

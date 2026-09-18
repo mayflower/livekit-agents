@@ -836,3 +836,41 @@ async def test_failed_send_with_a_queued_update_replays_each_item_once(
         assert session._unsent_item_ids == set()
     finally:
         await session.aclose()
+
+
+def _lookup_tool(description: str = "Look a caller detail up.") -> llm.FunctionTool:
+    """Built fresh each call, the way an agent rebuilds one per push."""
+
+    async def _lookup(query: str) -> str:
+        return ""
+
+    return llm.function_tool(_lookup, name="lookup", description=description)
+
+
+async def test_a_rebuilt_but_identical_tool_does_not_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Identical declarations must not cost the caller a session restart."""
+    async with _make_session(monkeypatch) as session:
+        await session.update_tools([_lookup_tool()])
+        session._session_should_close.clear()
+
+        rebuilt = _lookup_tool()
+        await session.update_tools([rebuilt])
+
+        assert not session._session_should_close.is_set()
+        # still adopted: the handler the caller just built is the one to run
+        assert session.tools.get_function_tool("lookup") is rebuilt
+
+
+async def test_a_changed_declaration_still_reconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The model only learns a new tool set from a new session."""
+    async with _make_session(monkeypatch) as session:
+        await session.update_tools([_lookup_tool()])
+        session._session_should_close.clear()
+
+        await session.update_tools([_lookup_tool("Look up something else entirely.")])
+
+        assert session._session_should_close.is_set()
