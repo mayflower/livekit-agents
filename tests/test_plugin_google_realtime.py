@@ -874,3 +874,41 @@ async def test_a_changed_declaration_still_reconnects(
         await session.update_tools([_lookup_tool("Look up something else entirely.")])
 
         assert session._session_should_close.is_set()
+
+
+async def test_a_reconnect_that_fails_is_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A server-side failure while resuming must not end the call."""
+    from google.genai.live import AsyncLive
+
+    opened: list[_FakeLiveSession] = []
+    attempts = 0
+
+    @asynccontextmanager
+    async def _connect(self: AsyncLive, **kwargs: object) -> AsyncIterator[_FakeLiveSession]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            raise RuntimeError("received 1011 (internal error) Internal error encountered.")
+        fake = _FakeLiveSession()
+        opened.append(fake)
+        yield fake
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    monkeypatch.setattr(AsyncLive, "connect", _connect)
+    session = RealtimeModel().session()
+    try:
+        while session._active_session is None:
+            await asyncio.sleep(0.01)
+
+        session._mark_restart_needed()
+
+        async def _reconnected() -> None:
+            while len(opened) < 2:
+                await asyncio.sleep(0.01)
+
+        # bounded: without the fix the second connect is fatal and no third follows
+        await asyncio.wait_for(_reconnected(), timeout=5)
+        assert attempts == 3
+        assert session._active_session is not None
+    finally:
+        await session.aclose()

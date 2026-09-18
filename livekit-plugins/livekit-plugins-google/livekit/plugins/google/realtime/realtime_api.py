@@ -552,6 +552,8 @@ class RealtimeSession(llm.RealtimeSession):
         self._in_user_activity = False
         self._session_lock = asyncio.Lock()
         self._num_retries = 0
+        # a connect has succeeded, so a later failure is the server's, not bad setup
+        self._connected_once = False
         # error recorded by the recv/send tasks so _main_task can bound retries
         # and surface it through the "error" event
         self._session_error: Exception | None = None
@@ -972,6 +974,7 @@ class RealtimeSession(llm.RealtimeSession):
                     model=self._opts.model, config=config
                 ) as session:
                     self._report_connection_acquired(time.perf_counter() - t0)
+                    self._connected_once = True
                     async with self._session_lock:
                         self._active_session = session
 
@@ -1079,8 +1082,10 @@ class RealtimeSession(llm.RealtimeSession):
                         ) from e
 
                     # we shouldn't retry when it's not connected, usually this means incorrect
-                    # parameters or setup
-                    if not session or max_retries == 0:
+                    # parameters or setup — true only for the first connect. A later one
+                    # reconnects a session whose parameters are proven, so the failure is the
+                    # server's and giving up costs the whole call.
+                    if (not session and not self._connected_once) or max_retries == 0:
                         self._emit_error(e, recoverable=False)
                         error_msg = "Failed to connect to Gemini Live"
                         if hint:
