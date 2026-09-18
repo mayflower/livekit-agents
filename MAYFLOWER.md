@@ -32,10 +32,10 @@ keeping it there is also what keeps it out of the diff an upstream PR would show
 `livekit-agent/pyproject.toml` under `[tool.uv.sources]`. Rev, not branch name:
 a moving ref would break `uv sync --locked`.
 
-Only `livekit-agents` is changed. uv nonetheless resolves the sibling plugins out
-of this repo's workspace rather than PyPI — a workspace member wins over an
-`{ index = "pypi" }` source — which is harmless, since they are the monorepo's own
-unmodified release.
+Only `livekit-agents` and `livekit-plugins-google` are changed. uv resolves every
+sibling plugin out of this repo's workspace rather than PyPI — a workspace member
+wins over an `{ index = "pypi" }` source — which is what carries the Google fixes,
+and is harmless for the rest, since they are the monorepo's own unmodified release.
 
 ## Moving to a newer upstream release
 
@@ -65,9 +65,10 @@ repository settings.
 
 ## What is patched
 
-Four commits, all against one defect class: **a finished tool result never
-reaching the caller.** Read this before porting them to a new release — a clean
-`git rebase` says the text still applies, not that the reasoning does.
+Six commits against two defect classes: **a finished tool result never reaching
+the caller** (1–4) and **a Gemini session dropped for no reason** (5–6). Read
+this before porting them to a new release — a clean `git rebase` says the text
+still applies, not that the reasoning does.
 
 ### 1. Concurrent chat-context writers lose each other's items
 
@@ -179,6 +180,52 @@ acknowledgement and loses.
 
 *Porting check:* is the call still unguarded, and does `_create_speech_task`
 still attach no handler? If upstream adds either, drop this.
+
+### 5. A rebuilt tool reconnects a session the API sees no change in
+
+*Files: `livekit-plugins-google/.../realtime/realtime_api.py`*
+
+The Gemini realtime session cannot mutate its tools in place, so `update_tools`
+reconnects — gated on `ToolContext.__eq__`, which compares tools by **object
+identity**: the right check for a session that can push a diff, the wrong one
+here. The caller cannot work around it either. A `@function_tool`-decorated
+*method* is a new object on every attribute access, so an agent that assembles
+its tool list per push pays a reconnect every time for a set the API cannot
+tell from the running one.
+
+The fix compares what is actually sent: the `types.Tool` list
+`_build_connect_config` puts in the connect config. Equal declarations adopt
+the new objects — their handlers are the ones the caller wants run — and return
+without a restart. Ultravox already compares tool names rather than identity,
+so Google is the outlier. Widening `ToolContext.__eq__` instead has the bigger
+blast radius: `_sync_flattened` depends on its `id()` semantics.
+
+*Porting check:* does `update_tools` still gate the restart on `ToolContext`
+equality alone? If upstream starts comparing declarations, or the Live API
+gains a tool update, drop this.
+
+### 6. A reconnect that fails once ends the call
+
+*Files: `livekit-plugins-google/.../realtime/realtime_api.py`*
+
+`_main_task` treats any failure raised before the socket is up as fatal:
+`if not session` — an unconnected session means bad parameters, not worth a
+retry. That holds for the first connect only. Every later one is a *reconnect*
+of a session that already worked, so the parameters are proven, the failure is
+the server's, and giving up costs the whole conversation.
+
+Gemini answered a reconnect for a tool update with `1011 Internal error`, the
+plugin raised `APIConnectionError`, and `AgentSession` closed mid-call. The fix
+records whether a connect ever succeeded and lets the existing bounded retry
+handle the rest — three attempts, 4.1s of silence at worst.
+
+It does not cover everything a reconnect can fail on: the retry re-sends the
+same `_session_resumption_handle`, so a handle the server has stopped accepting
+fails identically three times and the call ends anyway. Dropping the handle on
+the last attempt would trade the history for the call; nothing has needed it yet.
+
+*Porting check:* does the guard still read `if not session or max_retries == 0`?
+If upstream starts telling the first connect apart itself, drop this.
 
 ## Verifying a port
 
