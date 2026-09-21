@@ -268,6 +268,28 @@ mislabels `user_state`, which is what a trace and a Langfuse span read.
 without detection? If upstream gives the plugins a real interrupt channel, drop
 this and the plugin's synthetic emit with it.
 
+### 8. The caller's transcript arrives only once their turn is over
+
+*Files: `livekit-plugins-google/.../realtime/realtime_api.py`*
+
+The Live API reports the caller twice: `interim_input_transcription` carries a
+speculative hypothesis, resent in full while they speak, and
+`input_transcription` commits the authoritative text when the turn ends. The
+plugin read only the second, so a realtime caller side landed one block per
+turn — while `GeminiSTT` in this same package already read the first.
+
+The interim is emitted as a non-final `InputTranscriptionCompleted` under the
+generation's `input_id`, kept in its own field rather than appended: these are
+whole hypotheses, not deltas, and accumulating them reports "IchIch hätte".
+Three consequences of it arriving before the model has said anything:
+`_is_new_generation` must accept it, `_start_new_generation` must not read it as
+a barge-in (hence its `speech_started` argument), and a turn the service never
+commits falls back to the last hypothesis so it is not lost.
+
+*Porting checks:* does `interim_input_transcription` still exist beside
+`input_transcription`? Does the interim still precede the first model output? If
+upstream starts reading the interim field, drop this.
+
 ### 9. A realtime session's reasoning tokens are billed but never counted
 
 *Files: `metrics/base.py`, `metrics/usage.py`,
@@ -334,6 +356,47 @@ skip `output_reasoning_tokens`? Has anything started keying reasoning on a model
 name or on `thinking_config`? If upstream begins reporting reasoning usage for
 realtime sessions itself, drop this; if `OutputTokenDetails` gains an official
 reasoning field, keep the plugin's read and drop the rest.
+
+### 10. A reply with no instructions leaves the model nothing to answer
+
+*Files: `livekit-plugins-google/.../realtime/realtime_api.py`*
+
+`generate_reply()` assembles its turns from the caller's instructions and a "."
+placeholder that exists so Gemini sees a completed user turn. The 3.1 and 3.8
+models are excluded from the placeholder because they answer it with an empty
+turn — but with no instructions either, which is how an agent asks for an
+opening greeting, both parts fall away and a turn-less `LiveClientContent` goes
+on the wire: `turn_complete` against nothing.
+
+The models answer it, and answer nothing. Extended Thinking reads it as work
+already in flight and opens the call with a filler instead of the greeting
+("Ich sehe mir deine Anfrage direkt an."), then spends the call waiting on a
+request nobody made. Probed on that model: 3 of 3 empty-turn replies were
+fillers, 6 of 6 with the placeholder were greetings. The exclusion now applies
+only where a turn exists anyway.
+
+*Porting checks:* is `_needs_reply_placeholder` still keyed on the model? Do
+the listed models still answer a placeholder with an empty turn?
+
+### 11. A transcript the session was told not to expect
+
+*Files: `livekit-plugins-google/.../realtime/realtime_api.py`*
+
+`capabilities.user_transcription` reports whether `input_audio_transcription`
+was configured, and an `AgentSession` reads it to decide whether to put its own
+STT on the caller's audio. The session emitted
+`input_audio_transcription_completed` regardless. On Gemini 3.8 that is not
+hypothetical: probed against the API, a session configured with no input
+transcription at all still receives `input_transcription` for every turn. An
+agent pairing the model with its own STT — the only way to get a caller
+transcript that runs along — got both in `user_input_transcribed`.
+
+The three emit sites now run through one helper that returns early when no
+transcription was configured. The chat context still records the turn, so the
+model's own history is unchanged.
+
+*Porting checks:* do all emit sites still route through the helper? Does
+`capabilities.user_transcription` still derive from the config alone?
 
 ## Verifying a port
 
