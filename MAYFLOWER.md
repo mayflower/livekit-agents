@@ -65,10 +65,11 @@ repository settings.
 
 ## What is patched
 
-Six commits against two defect classes: **a finished tool result never reaching
-the caller** (1–4) and **a Gemini session dropped for no reason** (5–6). Read
-this before porting them to a new release — a clean `git rebase` says the text
-still applies, not that the reasoning does.
+Seven commits against three defect classes: **a finished tool result never
+reaching the caller** (1–4), **a Gemini session dropped for no reason** (5–6),
+and **a finished reply the session will not let out** (7). Read this before
+porting them to a new release — a clean `git rebase` says the text still
+applies, not that the reasoning does.
 
 ### 1. Concurrent chat-context writers lose each other's items
 
@@ -226,6 +227,43 @@ the last attempt would trade the history for the call; nothing has needed it yet
 
 *Porting check:* does the guard still read `if not session or max_retries == 0`?
 If upstream starts telling the first connect apart itself, drop this.
+
+### 7. A playout interrupt is booked as a caller turn
+
+*Files: `llm/realtime.py`, `voice/agent_activity.py`,
+`livekit-plugins-google/.../realtime/realtime_api.py`*
+
+`input_speech_started` is the only channel a realtime session has for "stop
+what you are saying", so the Gemini plugin emits it before every
+agent-initiated generation — the branch where `_pending_generation_fut` is
+unset. Nothing was heard from the caller. Fix 3 above made the session record
+that event as a turn, which closes the user-speaking latch, and the matching
+stop comes from `_mark_current_generation_done` — it lands when *that
+generation* completes. Playout authorization waits on the latch, so the
+agent's own reply waits out its own generation before it may play.
+
+Measured on one dev call: 6.7s, 10.4s and 2.8s of silence before three tool
+answers, with the audio probe recording no audible bucket and Deepgram no
+speech onset for the whole window. A fourth answer was cut off after 1.07s,
+because a second tool result opened a second generation whose synthetic event
+interrupted the first — the caller heard "Ich habe unter dem" and then a fresh
+answer saying nothing was found.
+
+`InputSpeechStartedEvent` gains `speech_detected`, default True. Every other
+plugin emits this event only from real detection — OpenAI from
+`InputAudioBufferSpeechStartedEvent`, hugging-voice from `SpeechStartedEvent` —
+so the default is what they already mean, and only Google passes False. The
+handler then interrupts and records nothing; the stop mirrors it, so it never
+ends a turn nobody started, and the two backstops from fix 3 clear the pairing
+flag with the latch.
+
+This is worth upstreaming ahead of fix 3: without the latch the event still
+mislabels `user_state`, which is what a trace and a Langfuse span read.
+
+*Porting checks:* does the plugin still emit `input_speech_started` on the
+`else` branch of the pending-generation check? Does anything else now emit it
+without detection? If upstream gives the plugins a real interrupt channel, drop
+this and the plugin's synthetic emit with it.
 
 ## Verifying a port
 
