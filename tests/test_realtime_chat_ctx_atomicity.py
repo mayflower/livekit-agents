@@ -252,6 +252,61 @@ async def test_a_client_vad_keeps_ownership_of_the_signals() -> None:
     assert activity._user_silence_event.is_set()
 
 
+async def test_a_playout_interrupt_is_not_a_user_turn() -> None:
+    """The Gemini plugin emits this event to stop playout, having heard nothing.
+
+    It fires before every agent-initiated generation, and its matching stop only
+    arrives when that generation completes. Latching on it would make the agent's
+    own reply wait out its own generation before it may play — measured at 6.7 s,
+    10.4 s and 2.8 s on one dev call, with the caller's mic provably silent.
+    """
+    from livekit.agents.llm import InputSpeechStartedEvent
+
+    activity = _speech_signal_activity()
+    interrupts: list[str] = []
+    activity.interrupt = lambda source=None, **_: interrupts.append(source)
+
+    activity._on_input_speech_started(InputSpeechStartedEvent(speech_detected=False))
+
+    assert activity._user_silence_event.is_set()
+    assert activity._audio_recognition._speaking is False
+    assert activity._session.user_state == "listening"
+    # the one thing it is for still happens
+    assert interrupts == ["audio_activity"]
+
+
+async def test_a_detected_turn_still_interrupts_and_latches() -> None:
+    """The default stays what every other plugin means by this event."""
+    from livekit.agents.llm import InputSpeechStartedEvent
+
+    activity = _speech_signal_activity()
+    interrupts: list[str] = []
+    activity.interrupt = lambda source=None, **_: interrupts.append(source)
+
+    activity._on_input_speech_started(InputSpeechStartedEvent())
+
+    assert not activity._user_silence_event.is_set()
+    assert activity._audio_recognition._speaking is True
+    assert interrupts == ["audio_activity"]
+
+
+async def test_a_stop_without_a_recorded_turn_changes_nothing() -> None:
+    """A stop that closes a playout interruption has no turn to end."""
+    from livekit.agents.llm import InputSpeechStartedEvent, InputSpeechStoppedEvent
+
+    activity = _speech_signal_activity()
+    activity.interrupt = lambda source=None, **_: None
+    activity._on_input_speech_started(InputSpeechStartedEvent(speech_detected=False))
+
+    activity._on_input_speech_stopped(
+        InputSpeechStoppedEvent(user_transcription_enabled=False)
+    )
+
+    assert activity._user_silence_event.is_set()
+    assert activity._audio_recognition._speaking is False
+    assert activity._session.user_state == "listening"
+
+
 def _speech_signal_activity() -> Any:
     """A real activity in the production shape: realtime turn detection, VAD de-wired.
 

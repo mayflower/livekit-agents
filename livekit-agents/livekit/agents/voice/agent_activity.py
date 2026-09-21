@@ -376,6 +376,9 @@ class AgentActivity(RecognitionHooks):
         self._speech_q: list[tuple[int, float, SpeechHandle]] = []
         self._user_silence_event: asyncio.Event = asyncio.Event()
         self._user_silence_event.set()
+        # whether the open input-speech event was a detected caller turn, so the
+        # matching stop only undoes bookkeeping a start actually did
+        self._rt_user_speech_recorded: bool = False
 
         # for false interruption handling
         self._paused_speech: _PausedSpeechInfo | None = None
@@ -2336,6 +2339,7 @@ class AgentActivity(RecognitionHooks):
                 "releasing the user-speaking latch so the agent can speak again",
                 _UNPAIRED_SPEECH_TIMEOUT,
             )
+            activity._rt_user_speech_recorded = False
             activity._mark_user_speaking(False)
 
         self._user_speech_release_timer = loop.call_later(
@@ -2360,22 +2364,30 @@ class AgentActivity(RecognitionHooks):
         def _on_session_reconnected(_ev: Any = None) -> None:
             activity = ref()
             if activity is not None:
+                activity._rt_user_speech_recorded = False
                 activity._mark_user_speaking(False)
 
         rt_session.on("session_reconnected", _on_session_reconnected)
         setattr(rt_session, _RECONNECT_ARMED_ATTR, True)
 
-    def _on_input_speech_started(self, _: llm.InputSpeechStartedEvent) -> None:
-        self._arm_reconnect_speech_release()
-        self._mark_user_speaking(True)
+    def _on_input_speech_started(self, ev: llm.InputSpeechStartedEvent) -> None:
+        # A provider that emits this to stop playout rather than because it heard
+        # the caller gets the interruption and nothing else. Recording it as a turn
+        # would latch `_user_silence_event`, and since the matching stop arrives
+        # only when the generation completes, the agent's own reply would wait out
+        # its own generation before it is allowed to play.
+        if ev.speech_detected:
+            self._rt_user_speech_recorded = True
+            self._arm_reconnect_speech_release()
+            self._mark_user_speaking(True)
 
-        if self.vad is None or self.using_default_vad:
-            self._session._update_user_state("speaking")
-            if self._audio_recognition:
-                self._audio_recognition._on_start_of_speech(
-                    started_at=time.time(),
-                    user_speaking_span=self._session._user_speaking_span,
-                )
+            if self.vad is None or self.using_default_vad:
+                self._session._update_user_state("speaking")
+                if self._audio_recognition:
+                    self._audio_recognition._on_start_of_speech(
+                        started_at=time.time(),
+                        user_speaking_span=self._session._user_speaking_span,
+                    )
 
         if self._rt_overlapping_speech_enabled:
             # the caller talking is not an interruption here; the model ends its own turn
@@ -2393,16 +2405,21 @@ class AgentActivity(RecognitionHooks):
                 )
 
     def _on_input_speech_stopped(self, ev: llm.InputSpeechStoppedEvent) -> None:
-        self._mark_user_speaking(False)
+        # Mirrors the start: a stop that closes a playout interruption has no turn
+        # to end. Releasing anyway would end a span nobody opened, and on a provider
+        # that pairs both kinds it would release a latch a real turn still holds.
+        if self._rt_user_speech_recorded:
+            self._rt_user_speech_recorded = False
+            self._mark_user_speaking(False)
 
-        if self.vad is None or self.using_default_vad:
-            if self._audio_recognition:
-                self._audio_recognition._on_end_of_speech(
-                    ended_at=time.time(),
-                    user_speaking_span=self._session._user_speaking_span,
-                )
+            if self.vad is None or self.using_default_vad:
+                if self._audio_recognition:
+                    self._audio_recognition._on_end_of_speech(
+                        ended_at=time.time(),
+                        user_speaking_span=self._session._user_speaking_span,
+                    )
 
-            self._session._update_user_state("listening")
+                self._session._update_user_state("listening")
 
         if ev.user_transcription_enabled:
             self._session._user_input_transcribed(
