@@ -21,7 +21,16 @@ from .tool_context import Tool, ToolChoice, ToolContext
 
 @dataclass
 class InputSpeechStartedEvent:
-    pass
+    speech_detected: bool = True
+    """Whether the provider actually detected the caller.
+
+    False when a plugin emits this event only to interrupt playout: the Gemini
+    plugin does that before every agent-initiated generation, because the event
+    is the one channel a realtime session has for "stop what you are saying".
+    A consumer that records user speech — ``user_state``, a VAD-fed latch, a
+    turn span — must ignore those, or it books the agent's own turn as the
+    caller's and holds back the reply it is about to speak.
+    """
 
 
 @dataclass
@@ -259,9 +268,7 @@ class RealtimeSession(ABC, rtc.EventEmitter[EventTypes | TEvent], Generic[TEvent
         self, chat_ctx: ChatContext
     ) -> None: ...  # can raise RealtimeError on Timeout
 
-    async def update_chat_ctx_with(
-        self, producer: Callable[[ChatContext], ChatContext]
-    ) -> None:
+    async def update_chat_ctx_with(self, producer: Callable[[ChatContext], ChatContext]) -> None:
         """Apply a change derived from the session's current chat context, atomically.
 
         ``update_chat_ctx`` is declarative: it takes the whole conversation and

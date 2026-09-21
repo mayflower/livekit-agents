@@ -1370,8 +1370,9 @@ class RealtimeSession(llm.RealtimeSession):
             self._pending_generation_fut = None
         else:
             # emit input_speech_started event before starting an agent initiated generation
-            # to interrupt the previous audio playout if any
-            self._handle_input_speech_started()
+            # to interrupt the previous audio playout if any. Nothing was heard from the
+            # caller here, so say so: the session records user speech off this event.
+            self._handle_input_speech_started(speech_detected=False)
 
         self.emit("generation_created", generation_event)
 
@@ -1523,8 +1524,11 @@ class RealtimeSession(llm.RealtimeSession):
         if not gen.audio_ch.closed:
             gen.audio_ch.close()
 
-    def _handle_input_speech_started(self) -> None:
-        self.emit("input_speech_started", llm.InputSpeechStartedEvent())
+    def _handle_input_speech_started(self, *, speech_detected: bool = True) -> None:
+        self.emit(
+            "input_speech_started",
+            llm.InputSpeechStartedEvent(speech_detected=speech_detected),
+        )
 
     def _handle_input_speech_stopped(self) -> None:
         self.emit(

@@ -560,9 +560,7 @@ class ChatContext:
                 is_given(tools)
                 and (item.type == "function_call" or item.type == "function_call_output")
                 and item.name not in valid_tools
-                and not (
-                    item.type == "function_call_output" and item.call_id in kept_calls
-                )
+                and not (item.type == "function_call_output" and item.call_id in kept_calls)
             ):
                 continue
 

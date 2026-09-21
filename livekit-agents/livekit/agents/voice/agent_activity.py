@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import weakref
 import contextlib
 import contextvars
 import heapq
 import json
 import time
+import weakref
 from collections.abc import AsyncGenerator, AsyncIterable, Callable, Coroutine, Iterator, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -376,6 +376,9 @@ class AgentActivity(RecognitionHooks):
         self._speech_q: list[tuple[int, float, SpeechHandle]] = []
         self._user_silence_event: asyncio.Event = asyncio.Event()
         self._user_silence_event.set()
+        # whether the open input-speech event was a detected caller turn, so the
+        # matching stop only undoes bookkeeping a start actually did
+        self._rt_user_speech_recorded: bool = False
 
         # for false interruption handling
         self._paused_speech: _PausedSpeechInfo | None = None
@@ -2333,14 +2336,23 @@ class AgentActivity(RecognitionHooks):
                 return
             logger.warning(
                 "no input_speech_stopped within %.0fs of input_speech_started — "
-                "releasing the user-speaking latch so the agent can speak again",
+                "releasing the user turn so the agent can speak again",
                 _UNPAIRED_SPEECH_TIMEOUT,
             )
-            activity._mark_user_speaking(False)
+            activity._release_unpaired_user_speech()
 
-        self._user_speech_release_timer = loop.call_later(
-            _UNPAIRED_SPEECH_TIMEOUT, _release
-        )
+        self._user_speech_release_timer = loop.call_later(_UNPAIRED_SPEECH_TIMEOUT, _release)
+
+    def _release_unpaired_user_speech(self) -> None:
+        """End a recorded user turn whose stop never came.
+
+        Both backstops go through the ordinary stop handler rather than
+        releasing the latch by hand: a start records ``user_state`` and opens
+        the speaking span as well as closing the latch, so releasing only the
+        latch leaves ``user_state`` reading "speaking" — and the span open —
+        until some later turn happens to pair up.
+        """
+        self._on_input_speech_stopped(llm.InputSpeechStoppedEvent(user_transcription_enabled=False))
 
     def _arm_reconnect_speech_release(self) -> None:
         """Release the latch when the realtime session reconnects.
@@ -2360,22 +2372,29 @@ class AgentActivity(RecognitionHooks):
         def _on_session_reconnected(_ev: Any = None) -> None:
             activity = ref()
             if activity is not None:
-                activity._mark_user_speaking(False)
+                activity._release_unpaired_user_speech()
 
         rt_session.on("session_reconnected", _on_session_reconnected)
         setattr(rt_session, _RECONNECT_ARMED_ATTR, True)
 
-    def _on_input_speech_started(self, _: llm.InputSpeechStartedEvent) -> None:
-        self._arm_reconnect_speech_release()
-        self._mark_user_speaking(True)
+    def _on_input_speech_started(self, ev: llm.InputSpeechStartedEvent) -> None:
+        # A provider that emits this to stop playout rather than because it heard
+        # the caller gets the interruption and nothing else. Recording it as a turn
+        # would latch `_user_silence_event`, and since the matching stop arrives
+        # only when the generation completes, the agent's own reply would wait out
+        # its own generation before it is allowed to play.
+        if ev.speech_detected:
+            self._rt_user_speech_recorded = True
+            self._arm_reconnect_speech_release()
+            self._mark_user_speaking(True)
 
-        if self.vad is None or self.using_default_vad:
-            self._session._update_user_state("speaking")
-            if self._audio_recognition:
-                self._audio_recognition._on_start_of_speech(
-                    started_at=time.time(),
-                    user_speaking_span=self._session._user_speaking_span,
-                )
+            if self.vad is None or self.using_default_vad:
+                self._session._update_user_state("speaking")
+                if self._audio_recognition:
+                    self._audio_recognition._on_start_of_speech(
+                        started_at=time.time(),
+                        user_speaking_span=self._session._user_speaking_span,
+                    )
 
         if self._rt_overlapping_speech_enabled:
             # the caller talking is not an interruption here; the model ends its own turn
@@ -2393,16 +2412,21 @@ class AgentActivity(RecognitionHooks):
                 )
 
     def _on_input_speech_stopped(self, ev: llm.InputSpeechStoppedEvent) -> None:
-        self._mark_user_speaking(False)
+        # Mirrors the start: a stop that closes a playout interruption has no turn
+        # to end. Releasing anyway would end a span nobody opened, and on a provider
+        # that pairs both kinds it would release a latch a real turn still holds.
+        if self._rt_user_speech_recorded:
+            self._rt_user_speech_recorded = False
+            self._mark_user_speaking(False)
 
-        if self.vad is None or self.using_default_vad:
-            if self._audio_recognition:
-                self._audio_recognition._on_end_of_speech(
-                    ended_at=time.time(),
-                    user_speaking_span=self._session._user_speaking_span,
-                )
+            if self.vad is None or self.using_default_vad:
+                if self._audio_recognition:
+                    self._audio_recognition._on_end_of_speech(
+                        ended_at=time.time(),
+                        user_speaking_span=self._session._user_speaking_span,
+                    )
 
-            self._session._update_user_state("listening")
+                self._session._update_user_state("listening")
 
         if ev.user_transcription_enabled:
             self._session._user_input_transcribed(
@@ -4754,9 +4778,7 @@ class AgentActivity(RecognitionHooks):
                 # removal, so it ignores what the conversation currently holds.
                 # It still goes through update_chat_ctx_with, to serialize with
                 # the appenders rather than race them.
-                await self._rt_session.update_chat_ctx_with(
-                    lambda _current: self._agent._chat_ctx
-                )
+                await self._rt_session.update_chat_ctx_with(lambda _current: self._agent._chat_ctx)
             except llm.RealtimeError as e:
                 logger.warning(
                     "failed to sync chat context to remove never-played messages",
@@ -4795,9 +4817,7 @@ class AgentActivity(RecognitionHooks):
 
                 # unlike the pipeline, a realtime model holds the call open server-side
                 try:
-                    await self._rt_session.update_chat_ctx_with(
-                        _appending(interrupted_fnc_outputs)
-                    )
+                    await self._rt_session.update_chat_ctx_with(_appending(interrupted_fnc_outputs))
                 except llm.RealtimeError as e:
                     logger.warning(
                         "failed to sync the tool results of an interrupted generation",
@@ -4900,9 +4920,7 @@ class AgentActivity(RecognitionHooks):
                     run_state._watch_handle(task)
 
                 try:
-                    await self._rt_session.update_chat_ctx_with(
-                        _appending(new_fnc_outputs)
-                    )
+                    await self._rt_session.update_chat_ctx_with(_appending(new_fnc_outputs))
                 except llm.RealtimeError as e:
                     logger.warning(
                         "failed to update chat context before generating the function calls results",  # noqa: E501
