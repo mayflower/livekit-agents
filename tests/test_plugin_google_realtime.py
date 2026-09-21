@@ -12,7 +12,11 @@ from google.genai import types
 
 from livekit.agents import llm, utils
 from livekit.plugins.google.realtime.api_proto import ClientEvents
-from livekit.plugins.google.realtime.realtime_api import RealtimeModel, RealtimeSession
+from livekit.plugins.google.realtime.realtime_api import (
+    RealtimeModel,
+    RealtimeSession,
+    _opened_by_interim_only,
+)
 from livekit.plugins.google.utils import create_function_response
 
 pytestmark = pytest.mark.unit
@@ -912,3 +916,135 @@ async def test_a_reconnect_that_fails_is_retried(monkeypatch: pytest.MonkeyPatch
         assert session._active_session is not None
     finally:
         await session.aclose()
+
+
+# --- interim caller transcription -------------------------------------------
+#
+# The Live API reports the caller twice: `interim_input_transcription` while
+# they are still speaking, resent in full on every update, and
+# `input_transcription` once the turn is committed. Reading only the second one
+# leaves the caller's side landing per turn.
+
+
+def _transcribed(session: RealtimeSession) -> list[tuple[str, bool, str]]:
+    seen: list[tuple[str, bool, str]] = []
+    session.on(
+        "input_audio_transcription_completed",
+        lambda ev: seen.append((ev.transcript, ev.is_final, ev.item_id)),
+    )
+    return seen
+
+
+async def test_interim_transcription_is_reported_while_the_caller_speaks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _make_session(monkeypatch) as session:
+        session._start_new_generation()
+        gen = session._current_generation
+        assert gen is not None
+        seen = _transcribed(session)
+
+        for hypothesis in ("Ich", "Ich hätte", "Ich hätte gern"):
+            session._handle_server_content(
+                types.LiveServerContent(
+                    interim_input_transcription=types.Transcription(text=hypothesis)
+                )
+            )
+
+        assert seen == [
+            ("Ich", False, gen.input_id),
+            ("Ich hätte", False, gen.input_id),
+            ("Ich hätte gern", False, gen.input_id),
+        ]
+
+
+async def test_interims_are_not_accumulated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each one carries the whole utterance so far, unlike the committed text
+    the service sends in pieces. Appending them would report "IchIch hätte"."""
+    async with _make_session(monkeypatch) as session:
+        session._start_new_generation()
+        gen = session._current_generation
+        assert gen is not None
+
+        for hypothesis in ("Ich", "Ich hätte gern"):
+            session._handle_server_content(
+                types.LiveServerContent(
+                    interim_input_transcription=types.Transcription(text=hypothesis)
+                )
+            )
+
+        assert gen.interim_input_transcription == "Ich hätte gern"
+        assert gen.input_transcription == ""
+
+
+async def test_the_committed_transcript_supersedes_the_interim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message can carry both. The final must be the last thing reported, or
+    a reader keying on the item id would be left showing the guess."""
+    async with _make_session(monkeypatch) as session:
+        session._start_new_generation()
+        seen = _transcribed(session)
+
+        session._handle_server_content(
+            types.LiveServerContent(
+                interim_input_transcription=types.Transcription(text="Ich hätte gern"),
+                input_transcription=types.Transcription(text="Ich hätte gerne Kaffee"),
+            )
+        )
+
+        assert [text for text, _, _ in seen] == [
+            "Ich hätte gern",
+            "Ich hätte gerne Kaffee",
+        ]
+
+
+async def test_a_turn_the_service_never_commits_still_lands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Not every turn gets an `input_transcription`. Dropping those loses the
+    caller's turn from the chat context, and the last interim would sit
+    non-final for the rest of the call."""
+    async with _make_session(monkeypatch) as session:
+        session._start_new_generation()
+        seen = _transcribed(session)
+
+        session._handle_server_content(
+            types.LiveServerContent(
+                interim_input_transcription=types.Transcription(text="Ja genau")
+            )
+        )
+        session._mark_current_generation_done()
+
+        assert seen[-1][:2] == ("Ja genau", True)
+        assert [item.text_content for item in session.chat_ctx.items] == ["Ja genau"]
+
+
+async def test_an_interim_opens_a_generation_without_claiming_a_barge_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The interim is speculative — the service discards some of them. Treating
+    one as a turn would stop the agent's playout over a caller's throat-clearing,
+    so only `server_content.interrupted` is allowed to do that."""
+    interim_only = types.LiveServerMessage(
+        server_content=types.LiveServerContent(
+            interim_input_transcription=types.Transcription(text="Äh")
+        )
+    )
+    with_model_turn = types.LiveServerMessage(
+        server_content=types.LiveServerContent(
+            interim_input_transcription=types.Transcription(text="Äh"),
+            model_turn=types.Content(parts=[types.Part(text="Hallo")]),
+        )
+    )
+
+    async with _make_session(monkeypatch) as session:
+        assert session._is_new_generation(interim_only) is True
+        assert _opened_by_interim_only(interim_only) is True
+        assert _opened_by_interim_only(with_model_turn) is False
+
+        started: list[bool] = []
+        session.on("input_speech_started", lambda ev: started.append(ev.speech_detected))
+        session._start_new_generation(speech_started=False)
+
+        assert started == []

@@ -190,6 +190,32 @@ class _RealtimeOptions:
     credentials: google.auth.credentials.Credentials | None = None
 
 
+def _interim_input_text(sc: types.LiveServerContent | None) -> str:
+    """The speculative caller transcript in this message, if it carries one.
+
+    A complete hypothesis rather than a delta: the service resends the whole
+    utterance so far while the caller is still speaking, and only commits it as
+    `input_transcription` once the turn ends.
+    """
+    if sc and (interim := sc.interim_input_transcription):
+        return interim.text or ""
+
+    return ""
+
+
+def _opened_by_interim_only(resp: types.LiveServerMessage) -> bool:
+    """Whether a speculative caller transcript is all this message carries."""
+    sc = resp.server_content
+    if resp.tool_call or not sc or not _interim_input_text(sc):
+        return False
+
+    return not (
+        sc.model_turn
+        or (sc.output_transcription and sc.output_transcription.text)
+        or (sc.input_transcription and sc.input_transcription.text)
+    )
+
+
 @dataclass
 class _ResponseGeneration:
     message_ch: utils.aio.Chan[llm.MessageGeneration]
@@ -201,6 +227,8 @@ class _ResponseGeneration:
     audio_ch: utils.aio.Chan[rtc.AudioFrame]
 
     input_transcription: str = ""
+    interim_input_transcription: str = ""
+    """The last speculative caller transcript, superseded by the committed one."""
     output_text: str = ""
 
     _created_timestamp: float = field(default_factory=time.time)
@@ -1216,7 +1244,16 @@ class RealtimeSession(llm.RealtimeSession):
                                     logger.debug("ignoring empty server content")
 
                         if self._is_new_generation(response):
-                            self._start_new_generation()
+                            # An interim caller transcript opens the generation
+                            # early so the transcript can run along, but it is
+                            # not a barge-in on its own: it is speculative, and
+                            # stopping playout for one would cut the agent off
+                            # over a noise the service goes on to discard. The
+                            # service says when a turn really started, through
+                            # `server_content.interrupted` above.
+                            self._start_new_generation(
+                                speech_started=not _opened_by_interim_only(response)
+                            )
                             if lk_google_debug:
                                 logger.debug(f"new generation started: {self._current_generation}")
 
@@ -1325,7 +1362,7 @@ class RealtimeSession(llm.RealtimeSession):
 
         return conf
 
-    def _start_new_generation(self) -> None:
+    def _start_new_generation(self, *, speech_started: bool = True) -> None:
         self._rejected_tool_calls = 0
         if self._current_generation and not self._current_generation._done:
             logger.warning("starting new generation while another is active. Finalizing previous.")
@@ -1368,7 +1405,7 @@ class RealtimeSession(llm.RealtimeSession):
             generation_event.user_initiated = True
             self._pending_generation_fut.set_result(generation_event)
             self._pending_generation_fut = None
-        else:
+        elif speech_started:
             # emit input_speech_started event before starting an agent initiated generation
             # to interrupt the previous audio playout if any. Nothing was heard from the
             # caller here, so say so: the session records user speech off this event.
@@ -1430,6 +1467,22 @@ class RealtimeSession(llm.RealtimeSession):
                     except ValueError as e:
                         logger.error(f"Error creating audio frame from Gemini data: {e}")
 
+        if interim_text := _interim_input_text(server_content):
+            # Resent in full while the caller speaks, so it REPLACES what came
+            # before rather than extending it — unlike input_transcription
+            # below, which the service commits in pieces. Handled ahead of that
+            # commit so a message carrying both ends on the authoritative text.
+            current_gen.interim_input_transcription = interim_text
+            self.emit(
+                "input_audio_transcription_completed",
+                llm.InputTranscriptionCompleted(
+                    item_id=current_gen.input_id,
+                    transcript=interim_text,
+                    is_final=False,
+                    turn_started_at=current_gen._created_timestamp,
+                ),
+            )
+
         if input_transcription := server_content.input_transcription:
             text = input_transcription.text
             if text:
@@ -1479,6 +1532,12 @@ class RealtimeSession(llm.RealtimeSession):
 
         # The only way we'd know that the transcription is complete is by when they are
         # done with generation
+        if not gen.input_transcription:
+            # A turn the service interim-transcribed and then never committed.
+            # Without this it is dropped from the chat context entirely, and the
+            # last interim is left marked non-final for the rest of the call.
+            gen.input_transcription = gen.interim_input_transcription
+
         if gen.input_transcription:
             self.emit(
                 "input_audio_transcription_completed",
@@ -1719,6 +1778,7 @@ class RealtimeSession(llm.RealtimeSession):
                 sc.output_transcription and sc.output_transcription and sc.output_transcription.text
             )
             or (sc.input_transcription and sc.input_transcription and sc.input_transcription.text)
+            or _interim_input_text(sc)
             # or (sc.generation_complete is not None)
             # or (sc.turn_complete is not None)
         ):
