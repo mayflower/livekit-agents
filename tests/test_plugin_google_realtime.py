@@ -1148,3 +1148,44 @@ async def test_instructions_reach_the_model_without_a_placeholder(
         await asyncio.sleep(0.05)
 
         assert _texts(fake.sent)[-1] == ["Sag Hallo."]
+
+
+async def test_an_unrequested_caller_transcript_is_not_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """3.8 transcribes the caller whether asked to or not.
+
+    With `input_audio_transcription=None` the session advertises
+    `user_transcription=False`, which is what lets an `AgentSession` put its own
+    STT on the caller. Forwarding the service's transcript anyway would put both
+    of them in `user_input_transcribed`.
+    """
+    async with _make_configured_session(monkeypatch, input_audio_transcription=None) as session:
+        session._start_new_generation()
+        seen = _transcribed(session)
+
+        session._handle_server_content(
+            types.LiveServerContent(input_transcription=types.Transcription(text="Hallo"))
+        )
+        session._mark_current_generation_done()
+
+        assert seen == []
+        # The model's own history still records the turn it heard.
+        assert [item.text_content for item in session.chat_ctx.items] == ["Hallo"]
+
+
+async def test_a_requested_caller_transcript_is_still_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _make_configured_session(
+        monkeypatch, input_audio_transcription=types.AudioTranscriptionConfig()
+    ) as session:
+        session._start_new_generation()
+        seen = _transcribed(session)
+
+        session._handle_server_content(
+            types.LiveServerContent(input_transcription=types.Transcription(text="Hallo"))
+        )
+        session._mark_current_generation_done()
+
+        assert [text for text, _, _ in seen] == ["Hallo", "Hallo"]

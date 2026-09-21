@@ -1418,6 +1418,35 @@ class RealtimeSession(llm.RealtimeSession):
 
         self.emit("generation_created", generation_event)
 
+    def _emit_input_transcription(
+        self, *, item_id: str, transcript: str, is_final: bool, turn_started_at: float
+    ) -> None:
+        """Report the caller's transcript, unless nobody asked for one.
+
+        Gemini 3.8 transcribes the caller whether or not `input_audio_transcription`
+        is configured, so the service sends one even when the session advertises
+        `capabilities.user_transcription = False`. Forwarding it anyway makes that
+        capability a lie: an `AgentSession` told the model does not transcribe the
+        caller puts its own STT on the same audio, and both land in
+        `user_input_transcribed` -- two transcripts of one turn, one of them the
+        batched one the caller configured their way out of.
+
+        The chat context still records the turn, so the model's own history is
+        unaffected either way.
+        """
+        if self._opts.input_audio_transcription is None:
+            return
+
+        self.emit(
+            "input_audio_transcription_completed",
+            llm.InputTranscriptionCompleted(
+                item_id=item_id,
+                transcript=transcript,
+                is_final=is_final,
+                turn_started_at=turn_started_at,
+            ),
+        )
+
     def _handle_server_content(self, server_content: types.LiveServerContent) -> None:
         current_gen = self._current_generation
         if not current_gen:
@@ -1478,14 +1507,11 @@ class RealtimeSession(llm.RealtimeSession):
             # below, which the service commits in pieces. Handled ahead of that
             # commit so a message carrying both ends on the authoritative text.
             current_gen.interim_input_transcription = interim_text
-            self.emit(
-                "input_audio_transcription_completed",
-                llm.InputTranscriptionCompleted(
-                    item_id=current_gen.input_id,
-                    transcript=interim_text,
-                    is_final=False,
-                    turn_started_at=current_gen._created_timestamp,
-                ),
+            self._emit_input_transcription(
+                item_id=current_gen.input_id,
+                transcript=interim_text,
+                is_final=False,
+                turn_started_at=current_gen._created_timestamp,
             )
 
         if input_transcription := server_content.input_transcription:
@@ -1496,14 +1522,11 @@ class RealtimeSession(llm.RealtimeSession):
                     # at beginning of the transcript
                     text = text.lstrip()
                 current_gen.input_transcription += text
-                self.emit(
-                    "input_audio_transcription_completed",
-                    llm.InputTranscriptionCompleted(
-                        item_id=current_gen.input_id,
-                        transcript=current_gen.input_transcription,
-                        is_final=False,
-                        turn_started_at=current_gen._created_timestamp,
-                    ),
+                self._emit_input_transcription(
+                    item_id=current_gen.input_id,
+                    transcript=current_gen.input_transcription,
+                    is_final=False,
+                    turn_started_at=current_gen._created_timestamp,
                 )
 
         if output_transcription := server_content.output_transcription:
@@ -1544,14 +1567,11 @@ class RealtimeSession(llm.RealtimeSession):
             gen.input_transcription = gen.interim_input_transcription
 
         if gen.input_transcription:
-            self.emit(
-                "input_audio_transcription_completed",
-                llm.InputTranscriptionCompleted(
-                    item_id=gen.input_id,
-                    transcript=gen.input_transcription,
-                    is_final=True,
-                    turn_started_at=gen._created_timestamp,
-                ),
+            self._emit_input_transcription(
+                item_id=gen.input_id,
+                transcript=gen.input_transcription,
+                is_final=True,
+                turn_started_at=gen._created_timestamp,
             )
 
             # since gemini doesn't give us a view of the chat history on the server side,
