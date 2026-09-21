@@ -158,6 +158,14 @@ class RealtimeModelMetrics(_BaseMetrics):
         audio_tokens: int = 0
         # image_tokens is deprecated, Realtime models no longer emit this metric
         image_tokens: int = 0
+        reasoning_tokens: int = 0
+        """Output tokens spent on hidden reasoning, for thinking realtime models.
+
+        A subset of output_tokens, like its LLM counterpart: a provider that
+        reports thinking separately from its response token count has to add it
+        in before filling output_tokens. It is not part of text_tokens
+        either — the caller never sees this text, but is billed for it.
+        """
 
     type: Literal["realtime_model_metrics"] = "realtime_model_metrics"
     label: str = ""

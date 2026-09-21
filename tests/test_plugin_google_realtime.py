@@ -11,6 +11,7 @@ import pytest
 from google.genai import types
 
 from livekit.agents import llm, utils
+from livekit.agents.metrics import RealtimeModelMetrics
 from livekit.plugins.google.realtime.api_proto import ClientEvents
 from livekit.plugins.google.realtime.realtime_api import (
     RealtimeModel,
@@ -138,6 +139,66 @@ async def test_unspoken_model_text_is_omitted_in_audio_session(
         assert gen.output_text == "Let me check."
         assert gen.text_ch.recv_nowait() == "Let me check."
         assert gen.text_ch.empty()
+
+
+async def test_thinking_tokens_are_reported_and_counted_in_the_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An Extended-Thinking model bills thinking tokens the caller never hears.
+
+    thoughts_token_count is its own field and is *not* part of
+    response_token_count — only total_token_count covers both. Reported
+    as-is, every thinking token would be missing from the usage a cost view
+    sums, so the billed output is understated by the whole reasoning budget.
+    """
+    async with _make_session(monkeypatch) as session:
+        session._start_new_generation()
+        collected: list[RealtimeModelMetrics] = []
+        session.on("metrics_collected", collected.append)
+
+        session._handle_usage_metadata(
+            types.UsageMetadata(
+                prompt_token_count=1000,
+                response_token_count=150,
+                thoughts_token_count=800,
+                total_token_count=1950,
+                response_tokens_details=[
+                    types.ModalityTokenCount(modality=types.MediaModality.TEXT, token_count=60),
+                    types.ModalityTokenCount(modality=types.MediaModality.AUDIO, token_count=90),
+                ],
+            )
+        )
+
+        assert len(collected) == 1
+        metrics = collected[0]
+        assert metrics.output_token_details.reasoning_tokens == 800
+        # RealtimeModelMetrics documents reasoning as a subset of output_tokens,
+        # so what Gemini leaves out has to be added in here.
+        assert metrics.output_tokens == 950
+        # ...and it stays out of the modality buckets: nobody heard or read it.
+        assert metrics.output_token_details.text_tokens == 60
+        assert metrics.output_token_details.audio_tokens == 90
+
+
+async def test_a_model_without_thinking_reports_no_reasoning_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plain Live models omit thoughts_token_count entirely."""
+    async with _make_session(monkeypatch) as session:
+        session._start_new_generation()
+        collected: list[RealtimeModelMetrics] = []
+        session.on("metrics_collected", collected.append)
+
+        session._handle_usage_metadata(
+            types.UsageMetadata(
+                prompt_token_count=1000,
+                response_token_count=150,
+                total_token_count=1150,
+            )
+        )
+
+        assert collected[0].output_token_details.reasoning_tokens == 0
+        assert collected[0].output_tokens == 150
 
 
 async def test_model_text_is_forwarded_in_text_modality(

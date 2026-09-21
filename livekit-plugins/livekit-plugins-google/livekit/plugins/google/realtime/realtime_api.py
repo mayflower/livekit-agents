@@ -1690,6 +1690,12 @@ class RealtimeSession(llm.RealtimeSession):
                     token_details_map["image_tokens"] += token_detail.token_count
             return token_details_map
 
+        # Thinking tokens are billed but sit outside response_token_count, and
+        # outside every modality bucket -- only total_token_count covers them.
+        # RealtimeModelMetrics documents reasoning as a subset of output_tokens,
+        # so they are added in there and reported separately for the split.
+        thinking_tokens = usage_metadata.thoughts_token_count or 0
+
         metrics = RealtimeModelMetrics(
             label=self._realtime_model.label,
             request_id=current_gen.response_id,
@@ -1698,7 +1704,7 @@ class RealtimeSession(llm.RealtimeSession):
             ttft=ttft,
             cancelled=False,
             input_tokens=usage_metadata.prompt_token_count or 0,
-            output_tokens=usage_metadata.response_token_count or 0,
+            output_tokens=(usage_metadata.response_token_count or 0) + thinking_tokens,
             total_tokens=usage_metadata.total_token_count or 0,
             tokens_per_second=(usage_metadata.response_token_count or 0) / duration
             if duration > 0
@@ -1715,6 +1721,7 @@ class RealtimeSession(llm.RealtimeSession):
             ),
             output_token_details=RealtimeModelMetrics.OutputTokenDetails(
                 **_token_details_map(usage_metadata.response_tokens_details),
+                reasoning_tokens=thinking_tokens,
             ),
             metadata=Metadata(
                 model_name=self._realtime_model.model, model_provider=self._realtime_model.provider

@@ -236,6 +236,7 @@ class ModelUsageCollector:
 
             usage.output_text_tokens += metrics.output_token_details.text_tokens
             usage.output_audio_tokens += metrics.output_token_details.audio_tokens
+            usage.output_reasoning_tokens += metrics.output_token_details.reasoning_tokens
             usage.output_tokens += metrics.output_tokens
             usage.session_duration += metrics.session_duration
 
