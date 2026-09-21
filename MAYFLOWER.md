@@ -65,9 +65,12 @@ repository settings.
 
 ## What is patched
 
-Seven commits against three defect classes: **a finished tool result never
-reaching the caller** (1–4), **a Gemini session dropped for no reason** (5–6),
-and **a finished reply the session will not let out** (7). Read this before
+Eleven commits against six defect classes: **a finished tool result never
+reaching the caller** (1–4), **a Gemini session dropped for no reason**
+(5–6), **a finished reply the session will not let out** (7), **a caller
+transcript that is not the one the session asked for** (8, 11), **a billed
+token nobody counts** (9), and **a request the provider is given nothing to
+answer** (10). Read this before
 porting them to a new release — a clean `git rebase` says the text still
 applies, not that the reasoning does.
 
@@ -264,6 +267,73 @@ mislabels `user_state`, which is what a trace and a Langfuse span read.
 `else` branch of the pending-generation check? Does anything else now emit it
 without detection? If upstream gives the plugins a real interrupt channel, drop
 this and the plugin's synthetic emit with it.
+
+### 9. A realtime session's reasoning tokens are billed but never counted
+
+*Files: `metrics/base.py`, `metrics/usage.py`,
+`livekit-plugins-google/.../realtime/realtime_api.py`*
+
+Gemini reports what a session spent on hidden reasoning in
+`usage_metadata.thoughts_token_count`, and leaves it out of
+`response_token_count`. It is billed all the same.
+`_handle_usage_metadata` read the response count and nothing else, so the
+reasoning left no trace in anything downstream: a consumer summing the reported
+usage undercounts the output by exactly the thinking.
+
+Probed against the Live API from a running pod on 2026-09-21, one turn with a
+tool call, every `usage_metadata` frame logged:
+
+```
+gemini-3.8-live-extended-thinking   response=46   thoughts=140
+                                    response=246  thoughts=496
+gemini-3.8-live                     response=14   thoughts=124
+                                    response=172  thoughts=111
+```
+
+A second probe, three one-word turns in a single `gemini-3.8-live` session, added
+three more frames: `response` stayed flat at 28/25/26 and `thoughts` at 60/66/66
+while only `prompt` grew, which is the context growing and not an accumulating
+counter — the collector is right to sum frames with `+=`.
+
+Note the second model. **Plain `gemini-3.8-live` thinks and bills for it with no
+`thinking_config` at all** — Extended Thinking is a matter of degree, not of
+kind. Nothing here may key on a model name or on whether thinking was
+configured; the field is read whenever the provider sends it.
+
+Three layers had to carry it, and none did. `RealtimeModelMetrics.OutputTokenDetails`
+had buckets for text, audio and image only. `ModelUsageCollector` fills
+`LLMModelUsage.output_reasoning_tokens` in the `LLMMetrics` branch alone; the
+realtime branch never touched it. And the plugin never read the field.
+
+`OutputTokenDetails` gains `reasoning_tokens`, the realtime branch of the
+collector maps it onto `output_reasoning_tokens`, and the plugin fills it. The
+plugin also adds the thinking into `output_tokens`, because reasoning is
+documented — and asserted in `tests/test_metrics_usage.py` for the LLM path — as
+a *subset* of `output_tokens`, never an addition to it; a provider whose response
+count excludes thinking has to add it in before reporting. The probe confirms the
+exclusion is real and not merely documented: in two of the frames above
+`thoughts` exceeds `response` outright (140 > 46, 124 > 14), which it could not
+if the response count already contained it. It stays out of `text_tokens` and
+`audio_tokens`: nobody heard or read it.
+
+Nothing here is derived from `total_token_count`, deliberately. The SDK documents
+it as the sum of prompt, candidates, tool-use and thoughts, but across two probes
+that held in only one of seven frames — in the other six `prompt + response`
+already equalled `total` and the thinking sat outside it, so anything reading
+`total` as the sum of its parts loses the thinking entirely. Whatever that
+inconsistency is, reading only `response_token_count` and `thoughts_token_count`
+is unaffected by it.
+
+This is not Gemini-specific. OpenAI's realtime plugin accepts a `reasoning`
+config for models like `gpt-realtime-2` and reports no reasoning usage either, so
+the same three layers now carry it for any realtime provider that fills the field.
+
+*Porting checks:* does `UsageMetadata` still separate `thoughts_token_count` from
+`response_token_count`? Does the realtime branch of `ModelUsageCollector` still
+skip `output_reasoning_tokens`? Has anything started keying reasoning on a model
+name or on `thinking_config`? If upstream begins reporting reasoning usage for
+realtime sessions itself, drop this; if `OutputTokenDetails` gains an official
+reasoning field, keep the plugin's read and drop the rest.
 
 ## Verifying a port
 
