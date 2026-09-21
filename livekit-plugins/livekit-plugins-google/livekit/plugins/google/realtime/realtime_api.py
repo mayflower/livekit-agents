@@ -892,7 +892,12 @@ class RealtimeSession(llm.RealtimeSession):
         turns = []
         if is_given(instructions):
             turns.append(types.Content(parts=[types.Part(text=instructions)], role="model"))
-        if _needs_reply_placeholder(self._opts.model):
+        if _needs_reply_placeholder(self._opts.model) or not turns:
+            # ``or not turns``: the models above are spared the placeholder because they
+            # answer it with an empty turn, but a turn-less LiveClientContent leaves them
+            # with nothing to answer at all. Gemini 3.8 Extended Thinking reads that as
+            # work already in flight and opens the call with a stalling filler --
+            # "Ich sehe mir deine Anfrage direkt an." -- in place of the greeting.
             turns.append(types.Content(parts=[types.Part(text=".")], role="user"))
         self._send_client_event(types.LiveClientContent(turns=turns, turn_complete=True))
 

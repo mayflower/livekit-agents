@@ -628,6 +628,7 @@ async def _connected_session(
     sent_after_handle: llm.ChatContext | None = None,
     pending: llm.ChatContext | None = None,
     caller_handle: bool = False,
+    model: str | None = None,
 ) -> AsyncIterator[tuple[RealtimeSession, _FakeLiveSession]]:
     """Connect once onto a fake socket.
 
@@ -646,12 +647,14 @@ async def _connected_session(
 
     monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
     monkeypatch.setattr(AsyncLive, "connect", _connect)
+    model_kwargs: dict[str, object] = {"model": model} if model else {}
     if caller_handle:
         session = RealtimeModel(
-            session_resumption=types.SessionResumptionConfig(handle=handle)
+            session_resumption=types.SessionResumptionConfig(handle=handle),
+            **model_kwargs,  # type: ignore[arg-type]
         ).session()
     else:
-        session = RealtimeModel().session()
+        session = RealtimeModel(**model_kwargs).session()  # type: ignore[arg-type]
         session._session_resumption_handle = handle
     if known is not None:
         session._resumption_chat_ctx = known
@@ -1109,3 +1112,39 @@ async def test_an_interim_opens_a_generation_without_claiming_a_barge_in(
         session._start_new_generation(speech_started=False)
 
         assert started == []
+
+
+@pytest.mark.parametrize(
+    "model", ["gemini-3.8-live", "gemini-3.8-live-extended-thinking", "gemini-2.0-flash-live-001"]
+)
+async def test_a_reply_without_instructions_still_carries_a_turn(
+    monkeypatch: pytest.MonkeyPatch, model: str
+) -> None:
+    """`generate_reply()` must never ask for a reply to nothing.
+
+    The 3.x models skip the "." placeholder because they answer it with an empty
+    turn, but with no instructions either that left a turn-less LiveClientContent
+    on the wire. Gemini 3.8 Extended Thinking reads that as work already in
+    flight and opens the call with "Ich sehe mir deine Anfrage direkt an."
+    instead of the greeting.
+    """
+    async with _connected_session(monkeypatch, handle=None, model=model) as (session, fake):
+        session.generate_reply()
+        await asyncio.sleep(0.05)
+
+        assert _texts(fake.sent)[-1] == ["."]
+
+
+async def test_instructions_reach_the_model_without_a_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exclusion above still holds where it was meant to: a reply that says
+    what to answer needs no stand-in turn to answer."""
+    async with _connected_session(monkeypatch, handle=None, model="gemini-3.8-live") as (
+        session,
+        fake,
+    ):
+        session.generate_reply(instructions="Sag Hallo.")
+        await asyncio.sleep(0.05)
+
+        assert _texts(fake.sent)[-1] == ["Sag Hallo."]
