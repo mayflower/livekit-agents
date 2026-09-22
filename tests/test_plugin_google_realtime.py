@@ -455,7 +455,10 @@ def _tool_output(
 
 @asynccontextmanager
 async def _make_connected_session(
-    monkeypatch: pytest.MonkeyPatch, *, non_blocking_tools: bool = False
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    non_blocking_tools: bool = False,
+    response_scheduling: bool = True,
 ) -> AsyncIterator[RealtimeSession]:
     """A session that believes it is connected, so update_chat_ctx actually emits.
 
@@ -466,6 +469,7 @@ async def _make_connected_session(
     async with _make_session(monkeypatch) as session:
         if non_blocking_tools:
             session._opts.tool_behavior = types.Behavior.NON_BLOCKING
+        session._opts.supports_response_scheduling = response_scheduling
         session._msg_ch = utils.aio.Chan[ClientEvents]()
         session._active_session = object()  # type: ignore[assignment]
         try:
@@ -511,6 +515,60 @@ async def test_tool_response_scheduling_follows_the_output(
         assert responses[0].function_responses is not None
         assert responses[0].function_responses[0].id == "fc_1"
         assert responses[0].function_responses[0].scheduling == scheduling
+
+
+async def test_a_model_that_rejects_scheduling_never_receives_the_field(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Some models declare tools NON_BLOCKING yet reject `scheduling` outright.
+
+    `gemini-3.8-live-extended-thinking` answers a FunctionResponse carrying the field with
+    websocket 1007 and drops the session, unrecoverably -- one interrupted tool call ends
+    the call. NON_BLOCKING therefore cannot stand in for "this model reads scheduling";
+    the caller says so, and an output that wants no reply is reported like a blocking one.
+    """
+    async with _make_connected_session(
+        monkeypatch, non_blocking_tools=True, response_scheduling=False
+    ) as session:
+        session._start_new_generation()
+        session._handle_tool_calls(_tool_call())
+        await _drain_sent(session)
+
+        chat_ctx = session.chat_ctx.copy()
+        chat_ctx.items.append(_tool_output(reply_required=False))
+        with caplog.at_level(logging.WARNING):
+            await session.update_chat_ctx(chat_ctx)
+
+        responses = [
+            m for m in await _drain_sent(session) if isinstance(m, types.LiveClientToolResponse)
+        ]
+        assert len(responses) == 1, f"the result still has to unblock the turn, got {responses}"
+        assert responses[0].function_responses is not None
+        assert responses[0].function_responses[0].scheduling is None
+        assert any("wants no reply" in r.message for r in caplog.records)
+
+
+async def test_an_explicit_scheduling_is_dropped_when_the_model_rejects_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The field is rejected whoever asked for it, so an explicit setting is dropped too."""
+    async with _make_connected_session(monkeypatch, response_scheduling=False) as session:
+        session._opts.tool_response_scheduling = types.FunctionResponseScheduling.WHEN_IDLE
+        session._start_new_generation()
+        session._handle_tool_calls(_tool_call())
+        await _drain_sent(session)
+
+        chat_ctx = session.chat_ctx.copy()
+        chat_ctx.items.append(_tool_output(reply_required=True))
+        await session.update_chat_ctx(chat_ctx)
+
+        responses = [
+            m for m in await _drain_sent(session) if isinstance(m, types.LiveClientToolResponse)
+        ]
+        assert len(responses) == 1
+        assert responses[0].function_responses is not None
+        assert responses[0].function_responses[0].scheduling is None
 
 
 async def test_blocking_tools_send_the_response_and_warn_it_cannot_be_silent(

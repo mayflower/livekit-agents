@@ -184,6 +184,7 @@ class _RealtimeOptions:
     api_version: NotGivenOr[str] = NOT_GIVEN
     tool_behavior: NotGivenOr[types.Behavior] = NOT_GIVEN
     tool_response_scheduling: NotGivenOr[types.FunctionResponseScheduling] = NOT_GIVEN
+    supports_response_scheduling: bool = True
     tool_choice: NotGivenOr[llm.ToolChoice | None] = NOT_GIVEN
     thinking_config: NotGivenOr[types.ThinkingConfig] = NOT_GIVEN
     session_resumption: NotGivenOr[types.SessionResumptionConfig] = NOT_GIVEN
@@ -288,6 +289,7 @@ class RealtimeModel(llm.RealtimeModel):
         context_window_compression: NotGivenOr[types.ContextWindowCompressionConfig] = NOT_GIVEN,
         tool_behavior: NotGivenOr[types.Behavior] = NOT_GIVEN,
         tool_response_scheduling: NotGivenOr[types.FunctionResponseScheduling] = NOT_GIVEN,
+        supports_response_scheduling: bool = True,
         session_resumption: NotGivenOr[types.SessionResumptionConfig] = NOT_GIVEN,
         api_version: NotGivenOr[str] = NOT_GIVEN,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
@@ -332,6 +334,7 @@ class RealtimeModel(llm.RealtimeModel):
             context_window_compression (ContextWindowCompressionConfig, optional): The configuration for context window compression. Defaults to None.
             tool_behavior (Behavior, optional): The behavior for tool call. Default behavior is BLOCK in Gemini Realtime API.
             tool_response_scheduling (FunctionResponseScheduling, optional): The scheduling for tool response. Default scheduling is WHEN_IDLE.
+            supports_response_scheduling (bool, optional): Whether the model reads `FunctionResponse.scheduling` at all. Defaults to True. Set it False for a model that rejects the field: it is dropped instead of sent, whether it was asked for explicitly or claimed for an output that wants no reply.
             session_resumption (SessionResumptionConfig, optional): The configuration for session resumption. Defaults to None.
             thinking_config (ThinkingConfig, optional): Native audio thinking configuration.
             conn_options (APIConnectOptions, optional): The configuration for the API connection. Defaults to DEFAULT_API_CONNECT_OPTIONS.
@@ -442,6 +445,7 @@ class RealtimeModel(llm.RealtimeModel):
             api_version=api_version,
             tool_behavior=tool_behavior,
             tool_response_scheduling=tool_response_scheduling,
+            supports_response_scheduling=supports_response_scheduling,
             conn_options=conn_options,
             http_options=http_options,
             media_resolution=media_resolution,
@@ -735,9 +739,13 @@ class RealtimeSession(llm.RealtimeSession):
                 append_ctx.items.append(item)
 
         if append_ctx.items:
-            # vertex drops `scheduling`, and Gemini reads it only on NON_BLOCKING tools
+            # vertex drops `scheduling`, and Gemini reads it only on NON_BLOCKING tools --
+            # but declaring them so does not mean the model reads the field, so the caller
+            # still has the last word through `supports_response_scheduling`.
             supports_silent_scheduling = (
-                not self._opts.vertexai and self._opts.tool_behavior == types.Behavior.NON_BLOCKING
+                not self._opts.vertexai
+                and self._opts.supports_response_scheduling
+                and self._opts.tool_behavior == types.Behavior.NON_BLOCKING
             )
             if not supports_silent_scheduling and (
                 silenced := [
@@ -746,17 +754,21 @@ class RealtimeSession(llm.RealtimeSession):
                     if item.type == "function_call_output" and not item.reply_required
                 ]
             ):
+                remedy = (
+                    "the model does not read FunctionResponse.scheduling"
+                    if not self._opts.supports_response_scheduling
+                    else "declare the tools NON_BLOCKING on the Gemini API to keep it silent"
+                )
                 logger.warning(
-                    "a tool result wants no reply, but Gemini will answer it anyway; declare "
-                    "the tools NON_BLOCKING on the Gemini API to keep it silent. Sending it "
-                    "regardless, since an unanswered call blocks the session.",
+                    f"a tool result wants no reply, but Gemini will answer it anyway; {remedy}. "
+                    "Sending it regardless, since an unanswered call blocks the session.",
                     extra={"functions": silenced},
                 )
 
             tool_results = get_tool_results_for_realtime(
                 append_ctx,
                 vertexai=self._opts.vertexai,
-                tool_response_scheduling=self._opts.tool_response_scheduling,
+                tool_response_scheduling=self._explicit_response_scheduling,
                 supports_silent_scheduling=supports_silent_scheduling,
             )
             turns: list[types.Content] = []
@@ -1620,6 +1632,18 @@ class RealtimeSession(llm.RealtimeSession):
             llm.InputSpeechStoppedEvent(user_transcription_enabled=False),
         )
 
+    @property
+    def _explicit_response_scheduling(self) -> NotGivenOr[types.FunctionResponseScheduling]:
+        """The scheduling the caller asked for, dropped where the model rejects the field.
+
+        A model that answers `scheduling` with a 1007 close does so whoever set it, so an
+        explicit setting cannot be honoured either -- the session would end on the first
+        tool result instead of on an interrupted one.
+        """
+        if not self._opts.supports_response_scheduling:
+            return NOT_GIVEN
+        return self._opts.tool_response_scheduling
+
     def _reject_tool_calls(self, function_calls: list[types.FunctionCall]) -> None:
         if not function_calls:
             return
@@ -1646,7 +1670,7 @@ class RealtimeSession(llm.RealtimeSession):
                     is_error=True,
                 ),
                 vertexai=self._opts.vertexai,
-                tool_response_scheduling=self._opts.tool_response_scheduling,
+                tool_response_scheduling=self._explicit_response_scheduling,
             )
             for fnc_call in function_calls
         ]
