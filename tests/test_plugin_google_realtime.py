@@ -1248,3 +1248,67 @@ async def test_a_requested_caller_transcript_is_still_reported(
         session._mark_current_generation_done()
 
         assert [text for text, _, _ in seen] == ["Hallo", "Hallo"]
+
+
+@pytest.mark.parametrize(
+    ("status", "claims_a_turn"),
+    [
+        (types.InteractionStatus.IN_PROGRESS, False),
+        (types.InteractionStatus.IDLE, True),
+        (None, True),
+    ],
+)
+async def test_a_turn_the_server_has_not_finished_does_not_interrupt_its_own_playout(
+    monkeypatch: pytest.MonkeyPatch,
+    status: types.InteractionStatus | None,
+    claims_a_turn: bool,
+) -> None:
+    """A filler ends with `turn_complete`, and the turn goes on regardless.
+
+    Gemini 3.8 Extended Thinking speaks while it works, and closes every
+    conversational filler with `turn_complete: true` — `interaction_status` is
+    what says whether it meant it. Opening the next generation as a turn of its
+    own emits `input_speech_started`, which the session reads as a barge-in and
+    answers by stopping playout: the model cuts itself off mid-filler, every
+    filler, for the whole tool call.
+
+    A model that never sends the field leaves it `None` and must keep today's
+    behaviour, where an agent-initiated generation does stop the playout before
+    it.
+    """
+    async with _make_session(monkeypatch) as session:
+        session._start_new_generation()
+        session._handle_server_content(
+            types.LiveServerContent(turn_complete=True, interaction_status=status)
+        )
+
+        started: list[bool] = []
+        session.on("input_speech_started", lambda ev: started.append(ev.speech_detected))
+        session._start_new_generation()
+
+        assert bool(started) is claims_a_turn
+
+
+async def test_a_barge_in_ends_a_turn_the_server_still_called_in_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Otherwise the caller's interruption leaves the turn latched open.
+
+    Nothing obliges the service to follow IN_PROGRESS with an IDLE once the
+    caller has taken the floor, and the next agent turn would then start without
+    stopping whatever is still playing.
+    """
+    async with _make_session(monkeypatch) as session:
+        session._start_new_generation()
+        session._handle_server_content(
+            types.LiveServerContent(
+                turn_complete=True, interaction_status=types.InteractionStatus.IN_PROGRESS
+            )
+        )
+        session._handle_server_content(types.LiveServerContent(interrupted=True))
+
+        started: list[bool] = []
+        session.on("input_speech_started", lambda ev: started.append(ev.speech_detected))
+        session._start_new_generation()
+
+        assert started == [False]

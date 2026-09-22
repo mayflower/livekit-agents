@@ -568,6 +568,8 @@ class RealtimeSession(llm.RealtimeSession):
         # means we're draining that turn's trailing events (which have no generation to attach
         # to). reset when the next generation starts.
         self._rejected_tool_calls = 0
+        # whether the service said its last `turn_complete` did not end the turn
+        self._interaction_in_progress = False
 
         self._session_resumption_handle: str | None = (
             self._opts.session_resumption.handle
@@ -1422,10 +1424,14 @@ class RealtimeSession(llm.RealtimeSession):
             generation_event.user_initiated = True
             self._pending_generation_fut.set_result(generation_event)
             self._pending_generation_fut = None
-        elif speech_started:
+        elif speech_started and not self._interaction_in_progress:
             # emit input_speech_started event before starting an agent initiated generation
             # to interrupt the previous audio playout if any. Nothing was heard from the
             # caller here, so say so: the session records user speech off this event.
+            #
+            # Not while the service is still working on the turn before: this
+            # generation continues that turn rather than opening one, and
+            # stopping playout for it cuts the model off mid-sentence.
             self._handle_input_speech_started(speech_detected=False)
 
         self.emit("generation_created", generation_event)
@@ -1559,6 +1565,13 @@ class RealtimeSession(llm.RealtimeSession):
             self._handle_input_speech_started()
 
         if server_content.turn_complete:
+            # `interaction_status` is always sent alongside `turn_complete`, and
+            # IN_PROGRESS means the model finished this utterance but not the
+            # turn -- it is still reasoning or running a tool, and more output
+            # follows. Models that do not send the field leave it None.
+            self._interaction_in_progress = (
+                server_content.interaction_status == types.InteractionStatus.IN_PROGRESS
+            )
             self._mark_current_generation_done()
 
     def _mark_current_generation_done(self) -> None:
@@ -1621,6 +1634,9 @@ class RealtimeSession(llm.RealtimeSession):
             gen.audio_ch.close()
 
     def _handle_input_speech_started(self, *, speech_detected: bool = True) -> None:
+        # The caller has the floor now, so the service's turn is over whether or
+        # not it ever follows its last IN_PROGRESS with an IDLE.
+        self._interaction_in_progress = False
         self.emit(
             "input_speech_started",
             llm.InputSpeechStartedEvent(speech_detected=speech_detected),
