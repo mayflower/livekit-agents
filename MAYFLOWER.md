@@ -65,11 +65,11 @@ repository settings.
 
 ## What is patched
 
-Fourteen commits in thirteen entries against six defect classes: **a finished
+Sixteen commits in fifteen entries against seven defect classes: **a finished
 tool result never reaching the caller** (1–4), **a Gemini session dropped for no
 reason** (5–6, 12), **a finished reply the session will not let out** (7, 13),
-**a caller
-transcript that is not the one the session asked for** (8, 11), **a billed
+**a caller transcript that is not the one the session asked for** (8, 11, 14),
+**a prompt change the model never takes as its instruction** (15), **a billed
 token nobody counts** (9), and **a request the provider is given nothing to
 answer** (10). Read this before
 porting them to a new release — a clean `git rebase` says the text still
@@ -461,6 +461,96 @@ package's new floor.
 *Porting checks:* is `interaction_status` still sent with `turn_complete`? Does
 an agent-initiated generation still emit `input_speech_started` before it
 starts? Did anything else start reading `turn_complete` as the end of a turn?
+
+### 14. A session STT beside a realtime model glues the whole call into one turn
+
+*Files: `livekit-agents/.../voice/audio_recognition.py`,
+`livekit-agents/.../voice/agent_activity.py`*
+
+A realtime model that does not transcribe the caller (`user_transcription`
+off) can be given an STT in the `AgentSession`, with
+`turn_detection="realtime_llm"` so the model keeps the turn and the STT only
+transcribes. `AudioRecognition` appended every STT final to one
+`_audio_transcript`, but commits a turn only after VAD, STT end of speech or a
+manual commit — none of which happens in this mode. Nothing was committed until
+the session closed, when `_commit_user_turn(audio_detached=True)` turned the
+whole call into one `user_turn` span and one user message. The trace showed
+`user_turn_count: 1` for a call of a dozen utterances, all of it after the
+agent's last answer.
+
+In `realtime_llm` mode each final now closes its own turn:
+`_end_realtime_user_turn` puts `lk.pii.user_transcript` and the confidence on
+the `user_turn` span, ends it and resets the transcript. A new hook,
+`on_realtime_user_turn`, has `AgentActivity` emit `conversation_item_added`
+with the user message, dated to the turn's start the way
+`_on_input_audio_transcription_completed` dates a provider's. Unlike there, the
+message goes into the session history only, not into the agent's chat context:
+the model heard the turn as audio, and a message it has not seen would reach
+it again as text on the next `update_chat_ctx` (the Google plugin, where Gemini
+transcribes anyway, even keeps the turn under its own `GI_` id). No reply is
+started, the model does that itself. Where no VAD opens the span, the first
+interim does. A model that transcribes the caller keeps reporting the turn
+itself, and the STT then only writes the span.
+
+*Porting checks:* does upstream still commit STT transcripts only via
+`_vad_base_turn_detection` / `_user_turn_committed`, so that `realtime_llm`
+never commits? Does `_on_input_audio_transcription_completed` still upsert the
+provider's message under the provider's id? Does `update_chat_ctx` still send
+a message the realtime session has not seen as new content? If upstream starts
+committing STT turns in `realtime_llm` mode, drop this.
+
+### 15. New instructions never become the system instruction again
+
+*Files: `livekit-plugins-google/.../realtime/realtime_api.py`*
+
+`update_instructions` on a live session sends the new text as a `model`-role
+conversation turn, and every restart the session makes resumes through the
+last `session_resumption` handle. A resumed connection keeps the system
+instruction it was opened with. Measured on `gemini-3.8-live` on 2026-09-23: a
+fresh connection told "always English" answered a German question in English
+2 of 2 times; a connection resumed with the same new system instruction went on
+in German 3 of 3 times, with its context intact. So a prompt that pins the
+conversation language cannot be moved mid-call, and neither can the caller's
+transcription: `input_audio_transcription` is connect-time config, which
+`update_options` does not carry. `speech_config.language_code` is no way round
+it — native-audio models accept it and ignore it.
+
+`RealtimeSession.reconnect(input_audio_transcription=...)` replaces the
+connection with a fresh one, no handle, opened with the current instructions
+as `system_instruction` and the new transcription config if given. The
+conversation is replayed as text the way every handle-less connect already
+replays it, without its tool calls.
+
+The part that needed the fix is calling it from inside a tool, which is where a
+language switch happens. The open call belongs to the old connection; the fresh
+one never issued it. Probed on `gemini-3.8-live` the same day, a
+`FunctionResponse` for a call the connection never issued is not rejected —
+it is ignored: 3 of 3 times the model skipped the replayed history and greeted
+the caller as if the call had just begun. The same result sent as text was
+answered in context, in English, 3 of 3, first audio 1.3–1.8 s after connect.
+The session now records the call ids each connection
+issued. A fresh connect strands them, and a result for a stranded call goes to
+the new connection as a `user` text turn — completed when the result wants a
+reply, as its `FunctionResponse` would have been answered. That covers all three
+moments the framework can deliver the result in: while the old socket is still
+closing (queued onto the new channel), while the new one connects (sent after
+the replay), and after it is up. Nothing reaches the old connection after the
+switch, so the first answer is the new connection's, under the new system
+instruction. The framework's auto-tool-reply wait takes that reply like any
+server-initiated generation. A result the deferred-reply path delivers keeps
+`reply_required=False`, so its turn stays open and the executor's own
+`generate_reply` asks for the answer.
+
+Not covered: a `FunctionResponse` for another call that was queued but unsent
+when `reconnect` dropped the channel is lost from the wire; the replay does not
+carry tool results either.
+
+*Porting checks:* does a resumed connection still ignore a new
+`system_instruction`? Does `update_options` still lack
+`input_audio_transcription`? Does the handle-less connect still replay with
+`exclude_function_call=True`? If Gemini starts accepting function history in
+client content, the stranded result could travel as a `functionResponse` part
+instead of text.
 
 ## Verifying a port
 
