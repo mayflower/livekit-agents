@@ -2461,6 +2461,21 @@ class AgentActivity(RecognitionHooks):
             self._agent._chat_ctx._upsert_item(msg)
             self._session._conversation_item_added(msg)
 
+    def on_realtime_user_turn(
+        self, transcript: str, *, confidence: float, started_at: float | None
+    ) -> None:
+        if isinstance(self.llm, llm.RealtimeModel) and self.llm.capabilities.user_transcription:
+            # the model reports the turn itself, see _on_input_audio_transcription_completed
+            return
+
+        msg = llm.ChatMessage(role="user", content=[transcript], transcript_confidence=confidence)
+        if started_at is not None:
+            msg.created_at = started_at
+            msg.metrics = {"started_speaking_at": started_at}
+        # history only: the model heard this turn as audio and holds it under its own item id,
+        # so adding it to the agent's chat context would send the caller to it a second time
+        self._session._conversation_item_added(msg)
+
     def _on_generation_created(self, ev: llm.GenerationCreatedEvent) -> None:
         if ev.user_initiated:
             # user_initiated generations are directly handled inside _realtime_reply_task

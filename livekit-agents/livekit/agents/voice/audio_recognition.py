@@ -157,6 +157,9 @@ class RecognitionHooks(Protocol):
     def on_agent_backchannel_opportunity(self, ev: _AgentBackchannelOpportunityEvent) -> None: ...
     def on_preemptive_generation(self, info: _PreemptiveGenerationInfo) -> None: ...
     def on_user_turn_exceeded(self, ev: UserTurnExceededEvent) -> None: ...
+    def on_realtime_user_turn(
+        self, transcript: str, *, confidence: float, started_at: float | None
+    ) -> None: ...
     def retrieve_chat_ctx(self) -> llm.ChatContext: ...
 
 
@@ -1245,6 +1248,13 @@ class AudioRecognition:
             # check user turn limit after accumulating transcript
             self._check_user_turn_limit(transcript)
 
+            if self._turn_detection_mode == "realtime_llm":
+                # the realtime model detects the turn and replies on its own, so nothing
+                # commits this transcript: without this, every final of the call would pile
+                # up into one user turn that only surfaces when the session closes
+                self._end_realtime_user_turn()
+                return
+
             if self._vad_base_turn_detection or self._user_turn_committed:
                 if transcript_changed:
                     self._hooks.on_preemptive_generation(
@@ -1308,6 +1318,9 @@ class AudioRecognition:
                 )
 
         elif ev.type == stt.SpeechEventType.INTERIM_TRANSCRIPT:
+            if self._turn_detection_mode == "realtime_llm" and ev.alternatives[0].text:
+                # no start of speech reaches this STT otherwise: open the turn on its first words
+                self._ensure_user_turn_span()
             self._hooks.on_interim_transcript(
                 ev,
                 speaking=self._speaking
@@ -1971,6 +1984,37 @@ class AudioRecognition:
         self._hooks.on_transcription_timeout(
             speech_duration=self._turn_speech_duration, turn_start=self._user_turn_start
         )
+
+    def _end_realtime_user_turn(self) -> None:
+        """Close the user turn a final transcript ends while a realtime model owns the turn.
+
+        Only records the turn -- its span and the user message; the model replies by itself."""
+        confidence = (
+            sum(self._final_transcript_confidence) / len(self._final_transcript_confidence)
+            if self._final_transcript_confidence
+            else 0
+        )
+        user_turn_span = self._ensure_user_turn_span(start_time=self._speech_start_time)
+        user_turn_span.set_attributes(
+            {
+                trace_types.ATTR_USER_TRANSCRIPT: self._audio_transcript,
+                trace_types.ATTR_TRANSCRIPT_CONFIDENCE: confidence,
+            }
+        )
+        if self._stt_request_ids:
+            user_turn_span.set_attribute(
+                trace_types.ATTR_PROVIDER_REQUEST_IDS, self._stt_request_ids
+            )
+        self._hooks.on_realtime_user_turn(
+            self._audio_transcript, confidence=confidence, started_at=self._user_turn_start
+        )
+        self._end_user_turn_span()
+        self._stt_request_ids = []
+        self._audio_transcript = ""
+        self._final_transcript_confidence = []
+        if not self._speaking:
+            self._speech_start_time = None
+            self._vad_speech_started = False
 
     def _ensure_user_turn_span(self, start_time: float | None = None) -> trace.Span:
         if self._user_turn_span and self._user_turn_span.is_recording():
