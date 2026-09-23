@@ -65,9 +65,10 @@ repository settings.
 
 ## What is patched
 
-Eleven commits against six defect classes: **a finished tool result never
-reaching the caller** (1–4), **a Gemini session dropped for no reason**
-(5–6), **a finished reply the session will not let out** (7), **a caller
+Fourteen commits in thirteen entries against six defect classes: **a finished
+tool result never reaching the caller** (1–4), **a Gemini session dropped for no
+reason** (5–6, 12), **a finished reply the session will not let out** (7, 13),
+**a caller
 transcript that is not the one the session asked for** (8, 11), **a billed
 token nobody counts** (9), and **a request the provider is given nothing to
 answer** (10). Read this before
@@ -292,7 +293,7 @@ upstream starts reading the interim field, drop this.
 
 ### 9. A realtime session's reasoning tokens are billed but never counted
 
-*Files: `metrics/base.py`, `metrics/usage.py`,
+*Files: `metrics/base.py`, `metrics/usage.py`, `telemetry/utils.py`,
 `livekit-plugins-google/.../realtime/realtime_api.py`*
 
 Gemini reports what a session spent on hidden reasoning in
@@ -322,10 +323,16 @@ Note the second model. **Plain `gemini-3.8-live` thinks and bills for it with no
 kind. Nothing here may key on a model name or on whether thinking was
 configured; the field is read whenever the provider sends it.
 
-Three layers had to carry it, and none did. `RealtimeModelMetrics.OutputTokenDetails`
+Four layers had to carry it, and none did. `RealtimeModelMetrics.OutputTokenDetails`
 had buckets for text, audio and image only. `ModelUsageCollector` fills
 `LLMModelUsage.output_reasoning_tokens` in the `LLMMetrics` branch alone; the
-realtime branch never touched it. And the plugin never read the field.
+realtime branch never touched it. The plugin never read the field. And
+`record_realtime_metrics`, which turns the metrics into the realtime span's
+`gen_ai.usage.*` attributes, wrote text, audio and cached counts only — so a
+trace backend pricing the span saw no thinking even once the metrics carried it.
+The LLM path's `gen_ai.set_usage_attributes` already set both reasoning
+spellings. The span half came as a second commit, after the first had shipped:
+the metrics carried the thinking, and Langfuse still billed none of it.
 
 `OutputTokenDetails` gains `reasoning_tokens`, the realtime branch of the
 collector maps it onto `output_reasoning_tokens`, and the plugin fills it. The
@@ -336,7 +343,10 @@ count excludes thinking has to add it in before reporting. The probe confirms th
 exclusion is real and not merely documented: in two of the frames above
 `thoughts` exceeds `response` outright (140 > 46, 124 > 14), which it could not
 if the response count already contained it. It stays out of `text_tokens` and
-`audio_tokens`: nobody heard or read it.
+`audio_tokens`: nobody heard or read it. The span gets
+`gen_ai.usage.reasoning.output_tokens` and the unofficial
+`gen_ai.usage.reasoning_tokens` Langfuse reads, set only when non-zero, as on
+the LLM path.
 
 Nothing here is derived from `total_token_count`, deliberately. The SDK documents
 it as the sum of prompt, candidates, tool-use and thoughts, but across two probes
@@ -348,14 +358,17 @@ is unaffected by it.
 
 This is not Gemini-specific. OpenAI's realtime plugin accepts a `reasoning`
 config for models like `gpt-realtime-2` and reports no reasoning usage either, so
-the same three layers now carry it for any realtime provider that fills the field.
+the same four layers now carry it for any realtime provider that fills the field.
 
 *Porting checks:* does `UsageMetadata` still separate `thoughts_token_count` from
 `response_token_count`? Does the realtime branch of `ModelUsageCollector` still
 skip `output_reasoning_tokens`? Has anything started keying reasoning on a model
 name or on `thinking_config`? If upstream begins reporting reasoning usage for
 realtime sessions itself, drop this; if `OutputTokenDetails` gains an official
-reasoning field, keep the plugin's read and drop the rest.
+reasoning field, keep the plugin's read and drop the rest. Does
+`record_realtime_metrics` still build its attributes by hand, apart from
+`set_usage_attributes`? If upstream routes it through the shared helper, drop
+the telemetry half.
 
 ### 10. A reply with no instructions leaves the model nothing to answer
 
@@ -397,6 +410,57 @@ model's own history is unchanged.
 
 *Porting checks:* do all emit sites still route through the helper? Does
 `capabilities.user_transcription` still derive from the config alone?
+
+### 12. A response scheduling the model rejects
+
+*Files: `livekit-plugins-google/.../realtime/realtime_api.py`*
+
+`FunctionResponse.scheduling` is not a field every Live model reads. Gemini 3.8
+Live and 3.8 Extended Thinking close the session on it with 1007, verbatim
+"Function response scheduling is not supported for this model". The plugin put
+it on the wire in two ways: the `tool_response_scheduling` the caller set, and a
+`SILENT` it derived by itself for any output that wants no reply — which is every
+output an interrupted turn owes — whenever the tools were declared
+`NON_BLOCKING`. The second needs no configuration at all to happen, so the
+session died on the first caller interruption that landed during a tool call.
+Google's own protocol example for Extended Thinking sends a bare `toolResponse`
+with no scheduling on it.
+
+`RealtimeModel` takes `supports_response_scheduling` (default `True`). Set
+`False`, the field is dropped rather than sent, whoever asked for it: the
+derived `SILENT` is no longer claimed, and an explicit setting is dropped too,
+since the model rejects it just the same and would end the session on the first
+tool result instead. The warning for a result Gemini will answer anyway names
+which of the two is the cause.
+
+*Porting checks:* do the 3.8 models still reject the field? Is `SILENT` still
+derived from the `NON_BLOCKING` declaration? Do all builders of tool responses
+still read the scheduling through `_explicit_response_scheduling`?
+
+### 13. A turn the service has not finished interrupts itself
+
+*Files: `livekit-plugins-google/.../realtime/realtime_api.py`,
+`livekit-plugins-google/pyproject.toml`*
+
+Gemini 3.8 Extended Thinking runs tools in the background and speaks
+conversational fillers while it does. Each filler ends with
+`turn_complete: true`, and the turn goes on regardless; `interaction_status`,
+sent alongside every `turn_complete`, is what says whether the service meant it
+— `IN_PROGRESS` for a finished utterance in an unfinished turn. The session read
+only `turn_complete`, so the output that followed opened a new agent-initiated
+generation, and such a generation emits `input_speech_started` first to stop the
+previous playout. The model cut itself off mid-sentence on every filler.
+
+The session now remembers an `IN_PROGRESS` and does not interrupt playout for
+the generation that continues it. The caller speaking clears the flag, since the
+floor is theirs whether or not the service ever follows up with `IDLE`. Models
+that do not send the field leave it `None` and behave as before.
+`LiveServerContent.interaction_status` arrived in google-genai 2.23, which is the
+package's new floor.
+
+*Porting checks:* is `interaction_status` still sent with `turn_complete`? Does
+an agent-initiated generation still emit `input_speech_started` before it
+starts? Did anything else start reading `turn_complete` as the end of a turn?
 
 ## Verifying a port
 
