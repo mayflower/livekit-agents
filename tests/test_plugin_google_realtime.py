@@ -1312,3 +1312,119 @@ async def test_a_barge_in_ends_a_turn_the_server_still_called_in_progress(
         session._start_new_generation()
 
         assert started == [False]
+
+
+class _RecordingLiveSession(_FakeLiveSession):
+    """Also records `turn_complete`, and can open with a tool call."""
+
+    def __init__(self, tool_call: types.LiveServerToolCall | None = None) -> None:
+        super().__init__()
+        self.completes: list[bool] = []
+        self._tool_call = tool_call
+
+    async def send_client_content(self, *, turns: object, turn_complete: bool) -> None:
+        await super().send_client_content(turns=turns, turn_complete=turn_complete)
+        self.completes.append(turn_complete)
+
+    async def receive(self) -> AsyncIterator[types.LiveServerMessage]:
+        if self._tool_call is not None:
+            yield types.LiveServerMessage(tool_call=self._tool_call)
+            self._tool_call = None
+        await self._closed.wait()
+
+
+@pytest.mark.parametrize("result_lands", ["before_close", "while_connecting", "after_connect"])
+async def test_a_reconnect_from_inside_a_tool_answers_on_the_fresh_connection(
+    monkeypatch: pytest.MonkeyPatch, result_lands: str
+) -> None:
+    """The tool's own result must reach the new connection, and not as a FunctionResponse.
+
+    The call belongs to the old connection; the fresh one never issued it and ignores a
+    response to it (probed: it greets the caller anew). Sent as a completed user turn, it is what
+    the new connection -- under the new system instruction -- answers first.
+    """
+    from google.genai.live import AsyncLive
+
+    history = llm.ChatContext.empty()
+    history.add_message(role="user", content="Können wir auf Englisch weitermachen?")
+    with_result = history.copy()
+    with_result.items.append(llm.FunctionCall(call_id="fc_1", name="switch", arguments="{}"))
+    with_result.items.append(
+        llm.FunctionCallOutput(call_id="fc_1", name="switch", output="now English", is_error=False)
+    )
+
+    old = _RecordingLiveSession(_tool_call("fc_1", "switch"))
+    new = _RecordingLiveSession()
+    sockets = [old, new]
+    configs: list[types.LiveConnectConfig] = []
+    connecting = asyncio.Event()
+    let_connect = asyncio.Event()
+    if result_lands != "while_connecting":
+        let_connect.set()
+
+    @asynccontextmanager
+    async def _connect(
+        self: AsyncLive, *, model: str, config: types.LiveConnectConfig
+    ) -> AsyncIterator[_FakeLiveSession]:
+        configs.append(config)
+        if len(configs) == 2:
+            connecting.set()
+            await let_connect.wait()
+        yield sockets[len(configs) - 1]
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    monkeypatch.setattr(AsyncLive, "connect", _connect)
+    session = RealtimeModel(instructions="Always answer in German.").session()
+    session._session_resumption_handle = "resume-1"
+    await session.update_chat_ctx(history)
+    try:
+        while "fc_1" not in session._issued_call_ids:
+            await asyncio.sleep(0.01)
+
+        # inside the tool
+        await session.update_instructions("Always answer in English.")
+        session.reconnect(
+            input_audio_transcription=types.AudioTranscriptionConfig(language_codes=["en-US"])
+        )
+
+        # the tool returns and the framework syncs its result
+        if result_lands == "while_connecting":
+            await connecting.wait()
+        elif result_lands == "after_connect":
+            while session._active_session is not new:
+                await asyncio.sleep(0.01)
+        await session.update_chat_ctx(with_result)
+        let_connect.set()
+        while session._active_session is not new:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+
+        fresh = configs[1]
+        assert fresh.session_resumption is not None
+        assert fresh.session_resumption.handle is None
+        assert fresh.system_instruction.parts[0].text == "Always answer in English."  # type: ignore[union-attr]
+        assert fresh.input_audio_transcription.language_codes == ["en-US"]  # type: ignore[union-attr]
+
+        assert [kind for kind, _ in old.sent + new.sent if kind == "tool_response"] == []
+        texts = _texts(new.sent)
+        assert texts[-1] == ["Result of the `switch` tool call: now English"]
+        assert new.completes[-1] is True
+        # the history is replayed once, ahead of the result
+        assert texts[:-1] == [["Können wir auf Englisch weitermachen?"]]
+    finally:
+        await session.aclose()
+
+
+async def test_a_result_for_a_call_of_the_live_connection_stays_a_function_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _make_connected_session(monkeypatch) as session:
+        session._start_new_generation()
+        session._handle_tool_calls(_tool_call())
+        ctx = llm.ChatContext.empty()
+        ctx.items.append(llm.FunctionCall(call_id="fc_1", name="lookup", arguments="{}"))
+        ctx.items.append(_tool_output())
+
+        await session.update_chat_ctx(ctx)
+
+        assert [type(m).__name__ for m in await _drain_sent(session)] == ["_ChatCtxToolResponse"]

@@ -582,6 +582,12 @@ class RealtimeSession(llm.RealtimeSession):
         self._pending_chat_ctx: llm.ChatContext | None = None
         # ids of chat ctx items queued but not yet sent, so a handle does not claim them
         self._unsent_item_ids: set[str] = set()
+        # calls the server issued on the connection being resumed, and calls a fresh
+        # connect left behind: the new connection never issued those, and ignores a
+        # FunctionResponse for one -- it answers as if the call had just begun
+        self._issued_call_ids: set[str] = set()
+        self._stranded_call_ids: set[str] = set()
+        self._fresh_connect_requested = False
 
         self._in_user_activity = False
         self._session_lock = asyncio.Lock()
@@ -697,6 +703,60 @@ class RealtimeSession(llm.RealtimeSession):
                 )
             )
 
+    def reconnect(
+        self,
+        *,
+        input_audio_transcription: NotGivenOr[types.AudioTranscriptionConfig] = NOT_GIVEN,
+    ) -> None:
+        """Replace the connection with a fresh one instead of resuming it.
+
+        A resumed connection keeps the system instruction it was opened with, so
+        `update_instructions` reaches it only as a conversation turn, and the caller's
+        transcription keeps its languages. A fresh connection opens with the current
+        instructions as `system_instruction` and with `input_audio_transcription`, if
+        given.
+
+        The price is the server-side context: the conversation is replayed as text,
+        without its tool calls. A result for a call still open on the old connection
+        is sent to the new one as text, and asks for the reply the call would have
+        got -- so this can be called from inside the tool whose result follows.
+        """
+        if is_given(input_audio_transcription):
+            self._opts.input_audio_transcription = input_audio_transcription
+        self._fresh_connect_requested = True
+        self._strand_issued_calls()
+        self._mark_restart_needed()
+
+    def _strand_issued_calls(self) -> None:
+        self._stranded_call_ids |= self._issued_call_ids
+        self._issued_call_ids.clear()
+
+    def _stranded_results(self, items: list[llm.ChatItem]) -> _ChatCtxContent | None:
+        """The results for stranded calls among `items`, as a user turn.
+
+        Completes the turn if any result wants a reply, as its FunctionResponse would.
+        """
+        outputs = [
+            item
+            for item in items
+            if item.type == "function_call_output" and item.call_id in self._stranded_call_ids
+        ]
+        if not outputs:
+            return None
+        return _ChatCtxContent(
+            turns=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(text=f"Result of the `{out.name}` tool call: {out.output}")
+                        for out in outputs
+                    ],
+                )
+            ],
+            turn_complete=any(out.reply_required for out in outputs),
+            item_ids={out.id for out in outputs},
+        )
+
     async def update_chat_ctx(self, chat_ctx: llm.ChatContext) -> None:
         # Check for system/developer messages that will be dropped
         system_msg_count = sum(
@@ -739,6 +799,10 @@ class RealtimeSession(llm.RealtimeSession):
             item = chat_ctx.get_by_id(item_id)
             if item:
                 append_ctx.items.append(item)
+
+        stranded = self._stranded_results(append_ctx.items)
+        if stranded is not None:
+            append_ctx.items = [i for i in append_ctx.items if i.id not in stranded.item_ids]
 
         if append_ctx.items:
             # vertex drops `scheduling`, and Gemini reads it only on NON_BLOCKING tools --
@@ -797,6 +861,10 @@ class RealtimeSession(llm.RealtimeSession):
                         function_responses=tool_results.function_responses, item_ids=item_ids
                     )
                 )
+
+        if stranded is not None:
+            self._unsent_item_ids |= stranded.item_ids
+            self._send_client_event(stranded)
 
         # since we don't have a view of the history on the server side, we'll assume
         # the current state is accurate. this isn't perfect because removals aren't done.
@@ -1012,6 +1080,10 @@ class RealtimeSession(llm.RealtimeSession):
             await self._close_active_session()
 
             self._session_should_close.clear()
+            if self._fresh_connect_requested:
+                self._fresh_connect_requested = False
+                self._session_resumption_handle = None
+                self._resumption_chat_ctx = None
             config = self._build_connect_config()
             session = None
             try:
@@ -1034,7 +1106,14 @@ class RealtimeSession(llm.RealtimeSession):
                             else:
                                 self._sync_chat_ctx(target, known=self._resumption_chat_ctx)
                         else:
+                            # a fresh connection knows none of the calls issued before it
+                            self._strand_issued_calls()
+                            stranded = None
                             if pending_ctx is not None:
+                                known_ids = {item.id for item in self._chat_ctx.items}
+                                stranded = self._stranded_results(
+                                    [i for i in pending_ctx.items if i.id not in known_ids]
+                                )
                                 self._chat_ctx = pending_ctx
 
                             system_msg_count = sum(
@@ -1063,6 +1142,11 @@ class RealtimeSession(llm.RealtimeSession):
                                 await session.send_client_content(
                                     turns=turns,  # type: ignore
                                     turn_complete=False,
+                                )
+                            if stranded is not None:
+                                await session.send_client_content(
+                                    turns=stranded.turns,  # type: ignore
+                                    turn_complete=bool(stranded.turn_complete),
                                 )
                             self._unsent_item_ids.clear()
 
@@ -1700,10 +1784,12 @@ class RealtimeSession(llm.RealtimeSession):
         gen = self._current_generation
         for fnc_call in tool_call.function_calls or []:
             arguments = json.dumps(fnc_call.args)
+            call_id = fnc_call.id or utils.shortuuid("fnc-call-")
+            self._issued_call_ids.add(call_id)
 
             gen.function_ch.send_nowait(
                 llm.FunctionCall(
-                    call_id=fnc_call.id or utils.shortuuid("fnc-call-"),
+                    call_id=call_id,
                     name=fnc_call.name,
                     arguments=arguments,
                 )
