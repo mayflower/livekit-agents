@@ -179,6 +179,32 @@ def test_usage_details_are_reported_alongside_the_totals() -> None:
     assert attrs["gen_ai.usage.reasoning.output_tokens"] == 50
 
 
+def test_realtime_reasoning_tokens_are_reported() -> None:
+    from livekit.agents.metrics import RealtimeModelMetrics
+    from livekit.agents.telemetry.utils import record_realtime_metrics
+
+    span, exporter = _exporting_span("realtime_inference")
+    record_realtime_metrics(
+        span,
+        RealtimeModelMetrics(
+            request_id="resp_1",
+            timestamp=0.0,
+            input_tokens=300,
+            output_tokens=186,
+            input_token_details=RealtimeModelMetrics.InputTokenDetails(text_tokens=300),
+            output_token_details=RealtimeModelMetrics.OutputTokenDetails(
+                audio_tokens=46, reasoning_tokens=140
+            ),
+        ),
+    )
+    span.end()
+
+    attrs = _attributes(exporter)
+    assert attrs["gen_ai.usage.output_tokens"] == 186
+    assert attrs["gen_ai.usage.reasoning.output_tokens"] == 140
+    assert attrs["gen_ai.usage.reasoning_tokens"] == 140
+
+
 def test_execute_tool_span() -> None:
     span, exporter = _exporting_span("function_tool")
     gen_ai.set_tool_attributes(

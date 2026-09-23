@@ -136,6 +136,11 @@ def record_realtime_metrics(span: trace.Span, ev: RealtimeModelMetrics) -> None:
         attrs[trace_types.ATTR_GEN_AI_USAGE_TEXT_CACHE_READ_INPUT_TOKENS] = cached.text_tokens
         attrs[trace_types.ATTR_GEN_AI_USAGE_AUDIO_CACHE_READ_INPUT_TOKENS] = cached.audio_tokens
         attrs[trace_types.ATTR_GEN_AI_USAGE_IMAGE_CACHE_READ_INPUT_TOKENS] = cached.image_tokens
+    if reasoning := ev.output_token_details.reasoning_tokens:
+        # a subset of output_tokens, as on the LLM path in gen_ai.set_usage_attributes
+        attrs[trace_types.ATTR_GEN_AI_USAGE_REASONING_OUTPUT_TOKENS] = reasoning
+        # unofficial spelling recognised by Langfuse, kept alongside the standard one
+        attrs[trace_types.ATTR_GEN_AI_USAGE_REASONING_TOKENS] = reasoning
     if ev.ttft >= 0:
         attrs[trace_types.ATTR_GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK] = ev.ttft
     if ev.ttft != -1:
