@@ -65,13 +65,13 @@ repository settings.
 
 ## What is patched
 
-Sixteen commits in fifteen entries against seven defect classes: **a finished
+Seventeen commits in sixteen entries against eight defect classes: **a finished
 tool result never reaching the caller** (1–4), **a Gemini session dropped for no
 reason** (5–6, 12), **a finished reply the session will not let out** (7, 13),
 **a caller transcript that is not the one the session asked for** (8, 11, 14),
 **a prompt change the model never takes as its instruction** (15), **a billed
-token nobody counts** (9), and **a request the provider is given nothing to
-answer** (10). Read this before
+token nobody counts** (9), **a request the provider is given nothing to
+answer** (10), and **a spoken sentence the trace loses** (16). Read this before
 porting them to a new release — a clean `git rebase` says the text still
 applies, not that the reasoning does.
 
@@ -551,6 +551,45 @@ carry tool results either.
 `exclude_function_call=True`? If Gemini starts accepting function history in
 client content, the stranded result could travel as a `functionResponse` part
 instead of text.
+
+### 16. A turn's text keeps only its last generation
+
+*Files: `livekit-agents/.../voice/agent_activity.py`*
+
+Since upstream's #7143 a speech handle owns one `agent_turn` span for its whole
+life: the follow-up generation after a tool call runs in a new task on the same
+handle, and `_agent_turn` continues the open span instead of opening a second
+one. The two writers of `lk.pii.response.text` on that span still assumed one
+generation per span. The pipeline path set it to the current step's text, the
+realtime path to the current generation's messages joined with `"\n"` — so each
+generation replaced the one before, and whatever the agent said ahead of a tool
+call vanished from the turn. The inference spans do not carry it either: a
+realtime generation's text is only ever written on the turn.
+
+Seen on a realtime call: one `agent_turn` with three `realtime_inference`
+children, two of them spoken, and the turn's text holding only the last
+sentence. The first ("Alles klar, ich schaue zuerst nach dem Kontakt und danach
+nach dem Wetter …") was in no span at all.
+
+Both writers now go through `_record_response_text`, which writes every
+assistant message the speech has stored (`speech_handle.chat_items`), in order,
+joined with `"\n"` — the join the realtime path already used within one
+generation. Derived from the stored messages rather than kept as a second
+buffer, it holds exactly what the conversation holds: the played part of an
+interrupted generation, nothing for a skipped one, and the raw text with any
+expressive markup, as before. A turn that says nothing still gets no attribute.
+
+Two other writers of the same key were checked and left alone. `llm_node` in
+`voice/generation.py` writes it on its own span, one per inference. The
+`session.say()` path (`_tts_task_impl`) writes the turn once: a `say()` handle
+never takes a second step, and a discarded preemptive turn is only ever handed
+to a `generate_reply` handle.
+
+*Porting checks:* does `_agent_turn` still continue one span across a speech
+handle's steps? Do the pipeline and realtime writers still call
+`speech_handle._item_added` with the assistant message before recording the
+text? Can a `say()` handle take a second step now? If upstream starts
+accumulating the text itself, drop this.
 
 ## Verifying a port
 
