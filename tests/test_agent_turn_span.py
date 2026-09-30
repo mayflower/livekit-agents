@@ -16,11 +16,14 @@ from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-from livekit.agents import Agent, RunContext, function_tool
-from livekit.agents.llm import FunctionToolCall
+from livekit.agents import Agent, AgentSession, RunContext, function_tool
+from livekit.agents.llm import FunctionCall, FunctionToolCall, GenerationCreatedEvent
 from livekit.agents.telemetry import set_tracer_provider, trace_types, tracer
 
+from .fake_io import FakeAudioOutput
+from .fake_realtime import FakeRealtimeModel, fake_capabilities
 from .fake_session import FakeActions, create_session, run_session
+from .test_realtime_agent_state_during_tool import _generation
 from .trace_schema import assert_trace_well_formed
 
 pytestmark = [pytest.mark.unit, pytest.mark.no_concurrent]
@@ -110,6 +113,71 @@ async def test_tool_call_is_one_agent_turn(span_exporter: InMemorySpanExporter) 
         assert turn.start_time <= child.start_time and child.end_time <= turn.end_time
     # the whole tree, not just the edges this test names (tests/trace_schema.py)
     assert_trace_well_formed(span_exporter.get_finished_spans())
+
+
+async def test_turn_text_is_what_every_generation_said(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.0, "What's the weather in Tokyo?")
+    actions.add_llm(
+        content="Let me check.",
+        tool_calls=[
+            FunctionToolCall(name="get_weather", arguments='{"location": "Tokyo"}', call_id="1")
+        ],
+    )
+    actions.add_tts(0.5)
+    actions.add_llm(content="It is sunny in Tokyo.", input="sunny in Tokyo")
+    actions.add_tts(1.0)
+
+    session = create_session(actions, speed_factor=2.0)
+    await asyncio.wait_for(run_session(session, _WeatherAgent(), drain_delay=1.0), timeout=60)
+
+    [turn] = _spans(span_exporter, "agent_turn")
+    assert (turn.attributes or {})[trace_types.ATTR_RESPONSE_TEXT] == (
+        "Let me check.\nIt is sunny in Tokyo."
+    )
+
+
+@pytest.mark.virtual_time
+async def test_realtime_turn_text_is_what_every_generation_said(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    # the tool reply is requested by the framework, on the same speech handle
+    model = FakeRealtimeModel(capabilities=fake_capabilities(auto_tool_reply_generation=False))
+
+    async def _next_reply() -> asyncio.Future[GenerationCreatedEvent]:
+        for _ in range(500):
+            if pending := [f for f in model.active_session._reply_futs if not f.done()]:
+                return pending[0]
+            await asyncio.sleep(0.01)
+        raise AssertionError("no generate_reply issued")
+
+    async with AgentSession(llm=model) as session:
+        session.output.audio = FakeAudioOutput()
+        await session.start(_WeatherAgent())
+
+        reply = session.generate_reply()
+        (await _next_reply()).set_result(
+            _generation(
+                response_id="first",
+                text="Let me check.",
+                audio_duration=0.5,
+                function_calls=[
+                    FunctionCall(call_id="1", name="get_weather", arguments='{"location": "Tokyo"}')
+                ],
+            )
+        )
+        (await _next_reply()).set_result(
+            _generation(response_id="second", text="It is sunny in Tokyo.", audio_duration=0.5)
+        )
+        await asyncio.wait_for(reply, timeout=10)
+
+    [turn] = _spans(span_exporter, "agent_turn")
+    assert len(_children(span_exporter, turn, "realtime_inference")) == 2
+    assert (turn.attributes or {})[trace_types.ATTR_RESPONSE_TEXT] == (
+        "Let me check.\nIt is sunny in Tokyo."
+    )
 
 
 async def test_plain_reply_is_one_generation(span_exporter: InMemorySpanExporter) -> None:

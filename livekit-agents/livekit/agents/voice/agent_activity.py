@@ -279,6 +279,22 @@ def _record_interruption(speech_handle: SpeechHandle) -> None:
     )
 
 
+def _record_response_text(span: trace.Span, speech_handle: SpeechHandle) -> None:
+    """Put everything the speech said on its agent_turn span, in order.
+
+    A turn can take several generations (a reply, then the reply to its tool results), each
+    adding its assistant messages to the speech; writing only the latest generation's text
+    would drop what the user heard before the tool ran. Module-level like
+    ``_record_interruption``."""
+    said = [
+        text
+        for item in speech_handle.chat_items
+        if item.type == "message" and item.role == "assistant" and (text := item.raw_text_content)
+    ]
+    if said:
+        span.set_attribute(trace_types.ATTR_RESPONSE_TEXT, "\n".join(said))
+
+
 @contextlib.contextmanager
 def _agent_turn(
     speech_handle: SpeechHandle,
@@ -4067,7 +4083,7 @@ class AgentActivity(RecognitionHooks):
             self._agent._chat_ctx.insert(msg)
             self._session._conversation_item_added(msg)
             speech_handle._item_added([msg])
-            current_span.set_attribute(trace_types.ATTR_RESPONSE_TEXT, forwarded_text)
+            _record_response_text(current_span, speech_handle)
 
         if not speech_handle.interrupted and len(tool_output.output) > 0:
             self._session._update_agent_state("thinking")
@@ -4749,7 +4765,6 @@ class AgentActivity(RecognitionHooks):
             )
 
         # create assistant message per generated message
-        trace_text_parts: list[str] = []
         any_skipped = False
         for entry in message_outputs:
             if entry.out.played == "skipped":
@@ -4771,7 +4786,6 @@ class AgentActivity(RecognitionHooks):
             if not forwarded_text:
                 continue
 
-            trace_text_parts.append(forwarded_text)
             chat_msg = _create_assistant_message(
                 message_id=entry.msg.message_id,
                 forwarded_text=forwarded_text,
@@ -4781,8 +4795,7 @@ class AgentActivity(RecognitionHooks):
             speech_handle._item_added([chat_msg])
             self._session._conversation_item_added(chat_msg)
 
-        if trace_text_parts:
-            current_span.set_attribute(trace_types.ATTR_RESPONSE_TEXT, "\n".join(trace_text_parts))
+        _record_response_text(current_span, speech_handle)
 
         # sync local chat ctx to the realtime server to remove any items the
         # model added but the user never heard (interrupted before we pulled
