@@ -3853,6 +3853,7 @@ class AgentActivity(RecognitionHooks):
         if speech_handle.interrupted:
             current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
             _record_interruption(speech_handle)
+            _record_playout_position(current_span, speech_handle, [])
             await utils.aio.cancel_and_wait(*tasks, wait_for_scheduled)
             return
 
@@ -3878,6 +3879,7 @@ class AgentActivity(RecognitionHooks):
         if speech_handle.interrupted:
             current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
             _record_interruption(speech_handle)
+            _record_playout_position(current_span, speech_handle, [])
             await utils.aio.cancel_and_wait(*tasks, *authorization_tasks)
             return
 
@@ -4539,6 +4541,7 @@ class AgentActivity(RecognitionHooks):
                 await tee.aclose()
             current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
             _record_interruption(speech_handle)
+            _record_playout_position(current_span, speech_handle, [])
             return  # TODO(theomonnom): remove the message from the serverside history
 
         started_speaking_at: float | None = None

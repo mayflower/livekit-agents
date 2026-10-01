@@ -328,3 +328,32 @@ def test_sampled_out_turn_is_still_handed_to_the_successor() -> None:
     assert reply._agent_turn_span is not None
     assert reply._agent_turn_started_at == 1.0
     assert reply._agent_turn_agent_name == "a"
+
+
+@pytest.mark.virtual_time
+async def test_follow_up_cut_before_it_plays_keeps_the_earlier_position(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    model = FakeRealtimeModel(capabilities=fake_capabilities(auto_tool_reply_generation=False))
+
+    async with AgentSession(llm=model) as session:
+        session.output.audio = FakeAudioOutput()
+        await session.start(_WeatherAgent())
+
+        reply = session.generate_reply()
+        (await _next_reply(model)).set_result(_weather_call_generation())  # 0.5 s, played out
+        follow_up = await _next_reply(model)
+        # the caller starts talking: the follow-up waits for silence before it may play
+        assert session._activity is not None
+        session._activity._user_silence_event.clear()
+        follow_up.set_result(
+            _generation(response_id="second", text="It is sunny in Tokyo.", audio_duration=2.0)
+        )
+        await asyncio.sleep(0.1)
+        reply.interrupt(force=True)
+        await asyncio.wait_for(reply, timeout=10)
+
+    [turn] = _spans(span_exporter, "agent_turn")
+    attrs = turn.attributes or {}
+    assert attrs[trace_types.ATTR_SPEECH_INTERRUPTED] is True
+    assert attrs[trace_types.ATTR_PLAYOUT_POSITION] == pytest.approx(0.5, abs=0.05)
