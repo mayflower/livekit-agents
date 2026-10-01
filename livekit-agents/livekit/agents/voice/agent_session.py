@@ -2181,17 +2181,24 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         last_speaking_time: float | None = None,
         claimed: bool = False,
     ) -> None:
-        # pinned to "speaking" while a `claim_user_turn` is active; voice
-        # transitions are recoverable from `_user_silence_event` on release
-        if self._user_turn_claims > 0 and state != "speaking":
-            return
-
         last_speaking_time_ns = (
             int(last_speaking_time * 1_000_000_000) if last_speaking_time else None
         )
 
         # `user_speaking` is the user's voice, not the state: a claimed turn (text input) takes
-        # the state without it, and speech starting inside one opens it on an unchanged state
+        # the state without it, and speech inside one opens and ends its own span while the
+        # state stays pinned
+        if state != "speaking" and self._user_speaking_span is not None:
+            # end_time = last_speaking_time or time.time()
+            # self._user_speaking_span.set_attribute(trace_types.ATTR_END_TIME, end_time)
+            self._user_speaking_span.end(end_time=last_speaking_time_ns)
+            self._user_speaking_span = None
+
+        # pinned to "speaking" while a `claim_user_turn` is active; voice
+        # transitions are recoverable from `_user_silence_event` on release
+        if self._user_turn_claims > 0 and state != "speaking":
+            return
+
         if state == "speaking" and self._user_speaking_span is None and not claimed:
             self._user_speaking_span = tracer.start_span(
                 "user_speaking", start_time=last_speaking_time_ns
@@ -2206,12 +2213,6 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
 
         if self._user_state == state:
             return
-
-        if state != "speaking" and self._user_speaking_span is not None:
-            # end_time = last_speaking_time or time.time()
-            # self._user_speaking_span.set_attribute(trace_types.ATTR_END_TIME, end_time)
-            self._user_speaking_span.end(end_time=last_speaking_time_ns)
-            self._user_speaking_span = None
 
         if state == "listening" and self._agent_state == "listening":
             self._set_user_away_timer()

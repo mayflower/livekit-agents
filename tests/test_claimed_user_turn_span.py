@@ -103,3 +103,28 @@ async def test_speech_inside_a_claimed_turn_keeps_its_span(
     assert span.start_time == int(started_at * 1_000_000_000)
     assert span.end_time is not None
     assert (span.end_time - span.start_time) / 1e9 == pytest.approx(0.5, abs=1e-3)
+
+
+async def test_each_utterance_inside_a_claimed_turn_gets_its_own_span(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    session = await _start_session(FakeActions())
+    activity = session._activity
+    assert activity is not None
+
+    starts: list[float] = []
+    async with session._claim_user_turn():
+        for _ in range(2):
+            await asyncio.sleep(0.5)
+            starts.append(time.time())
+            activity.on_start_of_speech(None, speech_start_time=starts[-1])
+            await asyncio.sleep(0.3)
+            activity.on_end_of_speech(None)
+        await asyncio.sleep(1.0)
+    await _close_session(session)
+
+    spans = sorted(_spans(span_exporter, "user_speaking"), key=lambda s: s.start_time or 0)
+    assert [s.start_time for s in spans] == [int(t * 1_000_000_000) for t in starts]
+    for span in spans:
+        assert span.start_time is not None and span.end_time is not None
+        assert (span.end_time - span.start_time) / 1e9 == pytest.approx(0.3, abs=1e-3)
