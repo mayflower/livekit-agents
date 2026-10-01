@@ -775,8 +775,13 @@ async def forward_generation(
             assert playout_fut is not None
             playback_ev = playout_fut.result()
             out.played = "full"
-            out.playback_position = playback_ev.playback_position
-            out.synchronized_transcript = playback_ev.synchronized_transcript
+            # wait_for_playout returns the previous segment's event when this one captured nothing
+            if (
+                audio_out is not None
+                and audio_output.captured_playout_segments > audio_out.captured_segments_before
+            ):
+                out.playback_position = playback_ev.playback_position
+                out.synchronized_transcript = playback_ev.synchronized_transcript
         elif text_out is not None and text_out.text:
             out.played = "full"
         return out

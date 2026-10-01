@@ -261,3 +261,31 @@ async def test_interrupted_commit_stays_skipped_without_any_capture() -> None:
     assert out.audio_out is not None
     assert audio_output.captured_playout_segments == out.audio_out.captured_segments_before
     assert out.played == "skipped"
+
+
+async def test_segment_without_audio_takes_no_position_from_the_previous_one() -> None:
+    audio_output = FakeAudioOutput()
+
+    async def _forward(*frames: rtc.AudioFrame) -> float:
+        async def _audio_source() -> AsyncIterable[rtc.AudioFrame]:
+            for frame in frames:
+                yield frame
+
+        out = await asyncio.wait_for(
+            forward_generation(
+                speech_handle=SpeechHandle.create(),
+                audio_output=audio_output,
+                text_output=None,
+                audio_source=_audio_source(),
+                text_source=None,
+                on_first_frame=lambda _fut, _out: None,
+                reconcile_playout_pause=lambda: None,
+            ),
+            timeout=5,
+        )
+        assert out.played == "full"
+        return out.playback_position
+
+    assert await _forward(_make_frame(0.2)) == pytest.approx(0.2)
+    # wait_for_playout still holds the first segment's event
+    assert await _forward() == 0.0
