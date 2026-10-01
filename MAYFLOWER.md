@@ -65,13 +65,14 @@ repository settings.
 
 ## What is patched
 
-Seventeen commits in sixteen entries against eight defect classes: **a finished
+Nineteen commits in eighteen entries against nine defect classes: **a finished
 tool result never reaching the caller** (1–4), **a Gemini session dropped for no
 reason** (5–6, 12), **a finished reply the session will not let out** (7, 13),
 **a caller transcript that is not the one the session asked for** (8, 11, 14),
 **a prompt change the model never takes as its instruction** (15), **a billed
 token nobody counts** (9), **a request the provider is given nothing to
-answer** (10), and **a spoken sentence the trace loses** (16). Read this before
+answer** (10), **a spoken sentence the trace loses** (16), and **a turn the
+trace times wrong** (17, 18). Read this before
 porting them to a new release — a clean `git rebase` says the text still
 applies, not that the reasoning does.
 
@@ -590,6 +591,71 @@ handle's steps? Do the pipeline and realtime writers still call
 `speech_handle._item_added` with the assistant message before recording the
 text? Can a `say()` handle take a second step now? If upstream starts
 accumulating the text itself, drop this.
+
+### 17. A realtime turn's cut has no position
+
+*Files: `livekit-agents/.../voice/agent_activity.py`,
+`livekit-agents/.../voice/speech_handle.py`*
+
+`lk.playout.position` says how many seconds of a turn had played when it was
+interrupted. The `say()` and pipeline paths wrote it; the realtime path did not,
+although `forward_generation` hands it the same `playback_position` per message
+and it already truncates the provider's copy of the message with it. On a
+realtime call on fix15 all six interrupted turns carried `lk.interrupted` and no
+position, so the trace could not tell a cut after the first word from one at the
+last.
+
+The pipeline writer had entry 16's blind spot: it summed the segments of the
+step that was cut. A turn whose first reply played out before a tool call and
+whose follow-up was then cut reported only the follow-up's share.
+
+Both now go through `_record_playout_position`. It appends each generation's
+per-segment `playback_position` to the speech handle (`_played_audio`) and,
+once the speech is interrupted, writes the sum. The shape is
+`_record_response_text`'s, except that nothing stored on the chat items says
+how long a message played, so the handle keeps the list. Only a turn's last
+generation can be cut — an interrupted step schedules no follow-up — so the
+earlier ones count with their full playout. A turn interrupted before any
+generation forwarded audio still gets no attribute. The `say()` writer is left
+alone: a `say()` handle never takes a second step.
+
+Not covered: a follow-up generation interrupted while it waits for
+authorization returns before it forwards anything, on both paths, and writes no
+position even when the generation before it played.
+
+*Porting checks:* does the realtime path still compute `playback_position` per
+message and write no position itself? Does `_agent_turn` still continue one
+span across a speech handle's steps? Does an interrupted step still end the
+handle without a follow-up? If upstream starts writing the realtime position,
+keep the sum across generations and drop the rest.
+
+### 18. A text turn is traced as a millisecond of speech
+
+*Files: `livekit-agents/.../voice/agent_session.py`*
+
+The default text input callback handles a message inside `_claim_user_turn`,
+which pins `user_state` to `"speaking"` so `wait_for_idle` waits for the turn.
+`_update_user_state` opened `user_speaking` whenever the state became
+`"speaking"`, so the claim opened the span and its release closed it, once
+`interrupt()` and a synchronous `generate_reply` had run: a `user_speaking` of
+about a millisecond for a turn nobody spoke.
+
+The claim now passes `claimed=True` and takes the state without the span; the
+state, its events and the idle hold are unchanged. The span is the user's voice,
+and speech can start inside a claim, where the state does not change. So the
+span is now opened before the same-state early return, and ended only on a
+change away from `"speaking"`. Before, such speech was folded into the claim's
+span and dated from the moment the text arrived.
+
+Every other caller passes no flag: the VAD hooks, the realtime speech handlers,
+and the claim's own release, which re-derives the state from
+`_user_silence_event` and opens the span itself if speech is under way without
+one.
+
+*Porting checks:* is `_claim_user_turn` still the only caller that sets
+`"speaking"` without audio? Does `_update_user_state` still own the
+`user_speaking` span? If upstream gives a text turn a span of its own, or stops
+claiming it, drop this.
 
 ## Verifying a port
 
