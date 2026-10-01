@@ -295,6 +295,19 @@ def _record_response_text(span: trace.Span, speech_handle: SpeechHandle) -> None
         span.set_attribute(trace_types.ATTR_RESPONSE_TEXT, "\n".join(said))
 
 
+def _record_playout_position(
+    span: trace.Span, speech_handle: SpeechHandle, outputs: Sequence[_ForwardOutput]
+) -> None:
+    """Add a generation's played audio to its speech, and put the turn's total on its
+    agent_turn span once the speech is interrupted.
+
+    The position is how far into the turn the cut came, so it counts the audio of the
+    generations before the one that was cut. Module-level like ``_record_response_text``."""
+    speech_handle._played_audio.extend(out.playback_position for out in outputs)
+    if speech_handle.interrupted and speech_handle._played_audio:
+        span.set_attribute(trace_types.ATTR_PLAYOUT_POSITION, sum(speech_handle._played_audio))
+
+
 @contextlib.contextmanager
 def _agent_turn(
     speech_handle: SpeechHandle,
@@ -4046,11 +4059,7 @@ class AgentActivity(RecognitionHooks):
 
         current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, speech_handle.interrupted)
         _record_interruption(speech_handle)
-        if speech_handle.interrupted and segment_outputs:
-            current_span.set_attribute(
-                trace_types.ATTR_PLAYOUT_POSITION,
-                sum(out.playback_position for out in segment_outputs),
-            )
+        _record_playout_position(current_span, speech_handle, segment_outputs)
 
         forwarded_text = "".join(out.forwarded_text for out in segment_outputs)
         if speech_handle.interrupted:
@@ -4796,6 +4805,7 @@ class AgentActivity(RecognitionHooks):
             self._session._conversation_item_added(chat_msg)
 
         _record_response_text(current_span, speech_handle)
+        _record_playout_position(current_span, speech_handle, [e.out for e in message_outputs])
 
         # sync local chat ctx to the realtime server to remove any items the
         # model added but the user never heard (interrupted before we pulled

@@ -57,6 +57,8 @@ class SpeechHandle:
         # internal tasks used by this generation
         self._tasks: list[asyncio.Task] = []
         self._chat_items: list[llm.ChatItem] = []
+        # seconds played per forwarded segment, across every generation of the turn
+        self._played_audio: list[float] = []
         self._num_steps = 1
         # one agent_turn span for the whole speech, however many generations (LLM steps) it
         # takes; opened by the first reply task, ended with the speech in _mark_done

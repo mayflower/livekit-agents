@@ -66,6 +66,25 @@ class _WeatherAgent(Agent):
         return f"sunny in {location}"
 
 
+async def _next_reply(model: FakeRealtimeModel) -> asyncio.Future[GenerationCreatedEvent]:
+    for _ in range(500):
+        if pending := [f for f in model.active_session._reply_futs if not f.done()]:
+            return pending[0]
+        await asyncio.sleep(0.01)
+    raise AssertionError("no generate_reply issued")
+
+
+def _weather_call_generation() -> GenerationCreatedEvent:
+    return _generation(
+        response_id="first",
+        text="Let me check.",
+        audio_duration=0.5,
+        function_calls=[
+            FunctionCall(call_id="1", name="get_weather", arguments='{"location": "Tokyo"}')
+        ],
+    )
+
+
 async def test_tool_call_is_one_agent_turn(span_exporter: InMemorySpanExporter) -> None:
     actions = FakeActions()
     actions.add_user_speech(0.5, 2.0, "What's the weather in Tokyo?")
@@ -146,29 +165,13 @@ async def test_realtime_turn_text_is_what_every_generation_said(
     # the tool reply is requested by the framework, on the same speech handle
     model = FakeRealtimeModel(capabilities=fake_capabilities(auto_tool_reply_generation=False))
 
-    async def _next_reply() -> asyncio.Future[GenerationCreatedEvent]:
-        for _ in range(500):
-            if pending := [f for f in model.active_session._reply_futs if not f.done()]:
-                return pending[0]
-            await asyncio.sleep(0.01)
-        raise AssertionError("no generate_reply issued")
-
     async with AgentSession(llm=model) as session:
         session.output.audio = FakeAudioOutput()
         await session.start(_WeatherAgent())
 
         reply = session.generate_reply()
-        (await _next_reply()).set_result(
-            _generation(
-                response_id="first",
-                text="Let me check.",
-                audio_duration=0.5,
-                function_calls=[
-                    FunctionCall(call_id="1", name="get_weather", arguments='{"location": "Tokyo"}')
-                ],
-            )
-        )
-        (await _next_reply()).set_result(
+        (await _next_reply(model)).set_result(_weather_call_generation())
+        (await _next_reply(model)).set_result(
             _generation(response_id="second", text="It is sunny in Tokyo.", audio_duration=0.5)
         )
         await asyncio.wait_for(reply, timeout=10)
@@ -178,6 +181,35 @@ async def test_realtime_turn_text_is_what_every_generation_said(
     assert (turn.attributes or {})[trace_types.ATTR_RESPONSE_TEXT] == (
         "Let me check.\nIt is sunny in Tokyo."
     )
+
+
+@pytest.mark.virtual_time
+async def test_realtime_playout_position_counts_every_generation(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    model = FakeRealtimeModel(capabilities=fake_capabilities(auto_tool_reply_generation=False))
+    audio_output = FakeAudioOutput()
+
+    async with AgentSession(llm=model) as session:
+        session.output.audio = audio_output
+        await session.start(_WeatherAgent())
+
+        reply = session.generate_reply()
+        (await _next_reply(model)).set_result(_weather_call_generation())  # 0.5 s, played out
+        (await _next_reply(model)).set_result(
+            _generation(response_id="second", text="It is sunny in Tokyo.", audio_duration=2.0)
+        )
+        while audio_output._started_at is None:
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.3)
+        reply.interrupt(force=True)
+        await asyncio.wait_for(reply, timeout=10)
+
+    [turn] = _spans(span_exporter, "agent_turn")
+    attrs = turn.attributes or {}
+    assert attrs[trace_types.ATTR_SPEECH_INTERRUPTED] is True
+    # the whole first generation and 0.3 s of the second, not the second alone
+    assert attrs[trace_types.ATTR_PLAYOUT_POSITION] == pytest.approx(0.8, abs=0.05)
 
 
 async def test_plain_reply_is_one_generation(span_exporter: InMemorySpanExporter) -> None:
