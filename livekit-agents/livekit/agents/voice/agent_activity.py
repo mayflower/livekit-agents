@@ -296,19 +296,17 @@ def _record_response_text(span: trace.Span, speech_handle: SpeechHandle) -> None
 
 
 def _record_playout_position(
-    span: trace.Span, speech_handle: SpeechHandle, outputs: Sequence[_ForwardOutput]
+    speech_handle: SpeechHandle, outputs: Sequence[_ForwardOutput]
 ) -> None:
-    """Add a generation's played audio to its speech, and put the turn's total on its
-    agent_turn span once the speech is interrupted.
+    """Add a generation's played audio to its speech.
 
-    The position is how far into the turn the cut came, so it counts the audio of the
-    generations before the one that was cut. A turn that played nothing gets no position.
+    ``SpeechHandle._end_agent_turn`` puts the total on the agent_turn span if the speech was
+    interrupted: the position is how far into the turn the cut came, so it counts the audio of
+    the generations before the one that was cut. A turn that played nothing gets no position.
     Module-level like ``_record_response_text``."""
     speech_handle._played_audio.extend(
         out.playback_position for out in outputs if out.played != "skipped"
     )
-    if speech_handle.interrupted and speech_handle._played_audio:
-        span.set_attribute(trace_types.ATTR_PLAYOUT_POSITION, sum(speech_handle._played_audio))
 
 
 @contextlib.contextmanager
@@ -2977,7 +2975,7 @@ class AgentActivity(RecognitionHooks):
         #  - generate a reply to the user input
 
         # interrupt all background speeches and wait for them to finish to update the chat context
-        await asyncio.gather(*self._interrupt_background_speeches(force=False))
+        await asyncio.gather(*self._interrupt_background_speeches(force=False, source="user_turn"))
 
         user_message = llm.ChatMessage(
             role="user",
@@ -3856,7 +3854,6 @@ class AgentActivity(RecognitionHooks):
         if speech_handle.interrupted:
             current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
             _record_interruption(speech_handle)
-            _record_playout_position(current_span, speech_handle, [])
             await utils.aio.cancel_and_wait(*tasks, wait_for_scheduled)
             return
 
@@ -3882,7 +3879,6 @@ class AgentActivity(RecognitionHooks):
         if speech_handle.interrupted:
             current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
             _record_interruption(speech_handle)
-            _record_playout_position(current_span, speech_handle, [])
             await utils.aio.cancel_and_wait(*tasks, *authorization_tasks)
             return
 
@@ -4064,7 +4060,7 @@ class AgentActivity(RecognitionHooks):
 
         current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, speech_handle.interrupted)
         _record_interruption(speech_handle)
-        _record_playout_position(current_span, speech_handle, segment_outputs)
+        _record_playout_position(speech_handle, segment_outputs)
 
         forwarded_text = "".join(out.forwarded_text for out in segment_outputs)
         if speech_handle.interrupted:
@@ -4544,7 +4540,6 @@ class AgentActivity(RecognitionHooks):
                 await tee.aclose()
             current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
             _record_interruption(speech_handle)
-            _record_playout_position(current_span, speech_handle, [])
             return  # TODO(theomonnom): remove the message from the serverside history
 
         started_speaking_at: float | None = None
@@ -4811,7 +4806,7 @@ class AgentActivity(RecognitionHooks):
             self._session._conversation_item_added(chat_msg)
 
         _record_response_text(current_span, speech_handle)
-        _record_playout_position(current_span, speech_handle, [e.out for e in message_outputs])
+        _record_playout_position(speech_handle, [e.out for e in message_outputs])
 
         # sync local chat ctx to the realtime server to remove any items the
         # model added but the user never heard (interrupted before we pulled

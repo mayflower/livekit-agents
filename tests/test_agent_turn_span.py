@@ -17,7 +17,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from livekit import rtc
-from livekit.agents import Agent, AgentSession, RunContext, function_tool, utils
+from livekit.agents import Agent, AgentSession, RunContext, function_tool, llm, utils
 from livekit.agents.llm import (
     FunctionCall,
     FunctionToolCall,
@@ -69,6 +69,17 @@ class _WeatherAgent(Agent):
 
     @function_tool
     async def get_weather(self, context: RunContext, location: str) -> str:
+        return f"sunny in {location}"
+
+
+class _SlowLookupAgent(Agent):
+    def __init__(self, *, lookup_time: float) -> None:
+        super().__init__(instructions="You are a helpful assistant.")
+        self._lookup_time = lookup_time
+
+    @function_tool
+    async def get_weather(self, context: RunContext, location: str) -> str:
+        await asyncio.sleep(self._lookup_time)
         return f"sunny in {location}"
 
 
@@ -225,6 +236,7 @@ async def test_realtime_turn_text_is_what_every_generation_said(
         "Let me check.\nIt is sunny in Tokyo."
     )
     # played out in full: a position belongs to a cut
+    assert (turn.attributes or {})[trace_types.ATTR_SPEECH_INTERRUPTED] is False
     assert trace_types.ATTR_PLAYOUT_POSITION not in (turn.attributes or {})
 
 
@@ -448,3 +460,59 @@ async def test_realtime_turn_cut_before_its_first_word_has_no_position(
     attrs = turn.attributes or {}
     assert attrs[trace_types.ATTR_SPEECH_INTERRUPTED] is True
     assert trace_types.ATTR_PLAYOUT_POSITION not in attrs
+
+
+@pytest.mark.virtual_time
+async def test_realtime_barge_in_during_a_tool_marks_the_turn_interrupted(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    model = FakeRealtimeModel(capabilities=fake_capabilities(auto_tool_reply_generation=False))
+
+    async with AgentSession(llm=model) as session:
+        session.output.audio = FakeAudioOutput()
+        await session.start(_SlowLookupAgent(lookup_time=3.0))
+
+        reply = session.generate_reply()
+        (await _next_reply(model)).set_result(_weather_call_generation())  # 0.5 s ack
+        await asyncio.sleep(1.5)  # the ack has played, the lookup still runs
+        model.active_session.emit("input_speech_started", llm.InputSpeechStartedEvent())
+        await asyncio.wait_for(reply, timeout=10)
+
+    [turn] = _spans(span_exporter, "agent_turn")
+    attrs = turn.attributes or {}
+    assert attrs[trace_types.ATTR_SPEECH_INTERRUPTED] is True
+    assert attrs[trace_types.ATTR_INTERRUPTION_SOURCE] == "audio_activity"
+    assert attrs[trace_types.ATTR_PLAYOUT_POSITION] == pytest.approx(0.5, abs=0.05)
+
+
+@pytest.mark.virtual_time
+async def test_pipeline_barge_in_during_a_tool_marks_the_turn_interrupted(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.0, "What's the weather in Tokyo?")
+    actions.add_llm(
+        content="Let me check.",
+        tool_calls=[
+            FunctionToolCall(name="get_weather", arguments='{"location": "Tokyo"}', call_id="1")
+        ],
+    )
+    actions.add_tts(0.5)  # plays at ~2.7s, the lookup runs until ~6.7s
+    actions.add_user_speech(4.0, 5.0, "Never mind.", stt_delay=0.2)
+    actions.add_llm("Okay.", input="Never mind.")
+    actions.add_tts(0.5)
+
+    session = create_session(actions)
+    await asyncio.wait_for(
+        run_session(session, _SlowLookupAgent(lookup_time=4.0), drain_delay=6.0), timeout=60
+    )
+
+    [turn] = [
+        s
+        for s in _spans(span_exporter, "agent_turn")
+        if (s.attributes or {}).get(trace_types.ATTR_RESPONSE_TEXT) == "Let me check."
+    ]
+    attrs = turn.attributes or {}
+    assert attrs[trace_types.ATTR_SPEECH_INTERRUPTED] is True
+    assert attrs[trace_types.ATTR_INTERRUPTION_SOURCE] == "user_turn"
+    assert attrs[trace_types.ATTR_PLAYOUT_POSITION] == pytest.approx(0.5, abs=0.05)

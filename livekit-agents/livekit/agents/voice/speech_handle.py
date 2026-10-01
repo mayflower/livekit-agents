@@ -413,6 +413,18 @@ class SpeechHandle:
             )
         if not span.is_recording():
             return
+        if self.interrupted:
+            # also an interruption no generation was left to record: a caller talking over a
+            # running tool cuts the turn between two generations. Only ever adds: the handle
+            # cannot be un-interrupted, and the generations write True only when it was
+            span.set_attributes(
+                {
+                    trace_types.ATTR_SPEECH_INTERRUPTED: True,
+                    trace_types.ATTR_INTERRUPTION_SOURCE: self._interrupt_source or "programmatic",
+                }
+            )
+            if self._played_audio:
+                span.set_attribute(trace_types.ATTR_PLAYOUT_POSITION, sum(self._played_audio))
         if isinstance(error, Exception):
             trace_utils.record_exception(span, error)
         span.end()
