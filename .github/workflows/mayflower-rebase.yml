@@ -102,6 +102,23 @@ jobs:
           version_file=livekit-agents/livekit/agents/version.py
           sed -i "s/^__version__ = \".*\"$/__version__ = \"${{ steps.plan.outputs.to_version }}+mayflower.1\"/" "$version_file"
           git commit -q -m "chore: mark this build as the mayflower fork of ${{ steps.plan.outputs.to_version }}" "$version_file"
+
+          # The bundled audio clips are Git LFS objects upstream, but a git
+          # install (uv, pip) does not fetch LFS: it gets 130-byte pointer
+          # files and every BuiltinAudioClip then fails to decode. Commit the
+          # real bytes instead, so no consumer needs git-lfs. Build branch
+          # only, for the same reason as the version marker: it is no business
+          # of an upstream PR.
+          resources=livekit-agents/livekit/agents/resources
+          git lfs install --local
+          git lfs pull --include="$resources/*"
+          git rm -q "$resources/.gitattributes"
+          git add "$resources"
+          git commit -q -m "build: ship the bundled audio clips as plain files"
+          if [ "$(git cat-file -s "HEAD:$resources/keyboard-typing.ogg")" -lt 1024 ]; then
+            echo "keyboard-typing.ogg is still an LFS pointer" >&2
+            exit 1
+          fi
           git push --force-with-lease origin "$build"
 
           echo "build=$build" >> "$GITHUB_OUTPUT"
