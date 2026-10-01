@@ -302,8 +302,11 @@ def _record_playout_position(
     agent_turn span once the speech is interrupted.
 
     The position is how far into the turn the cut came, so it counts the audio of the
-    generations before the one that was cut. Module-level like ``_record_response_text``."""
-    speech_handle._played_audio.extend(out.playback_position for out in outputs)
+    generations before the one that was cut. A turn that played nothing gets no position.
+    Module-level like ``_record_response_text``."""
+    speech_handle._played_audio.extend(
+        out.playback_position for out in outputs if out.played != "skipped"
+    )
     if speech_handle.interrupted and speech_handle._played_audio:
         span.set_attribute(trace_types.ATTR_PLAYOUT_POSITION, sum(speech_handle._played_audio))
 

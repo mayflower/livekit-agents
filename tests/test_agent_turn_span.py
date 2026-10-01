@@ -16,8 +16,14 @@ from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-from livekit.agents import Agent, AgentSession, RunContext, function_tool
-from livekit.agents.llm import FunctionCall, FunctionToolCall, GenerationCreatedEvent
+from livekit import rtc
+from livekit.agents import Agent, AgentSession, RunContext, function_tool, utils
+from livekit.agents.llm import (
+    FunctionCall,
+    FunctionToolCall,
+    GenerationCreatedEvent,
+    MessageGeneration,
+)
 from livekit.agents.telemetry import set_tracer_provider, trace_types, tracer
 
 from .fake_io import FakeAudioOutput
@@ -357,3 +363,49 @@ async def test_follow_up_cut_before_it_plays_keeps_the_earlier_position(
     attrs = turn.attributes or {}
     assert attrs[trace_types.ATTR_SPEECH_INTERRUPTED] is True
     assert attrs[trace_types.ATTR_PLAYOUT_POSITION] == pytest.approx(0.5, abs=0.05)
+
+
+@pytest.mark.virtual_time
+async def test_realtime_turn_cut_before_its_first_word_has_no_position(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    model = FakeRealtimeModel(capabilities=fake_capabilities())
+
+    async with AgentSession(llm=model) as session:
+        session.output.audio = FakeAudioOutput()
+        await session.start(Agent(instructions="test"))
+
+        reply = session.generate_reply()
+        message_ch = utils.aio.Chan[MessageGeneration]()
+        function_ch = utils.aio.Chan[FunctionCall]()
+        text_ch = utils.aio.Chan[str]()
+        audio_ch = utils.aio.Chan[rtc.AudioFrame]()  # no frame arrives before the cut
+        modalities = asyncio.Future[list[str]]()
+        modalities.set_result(["audio", "text"])
+        message_ch.send_nowait(
+            MessageGeneration(
+                message_id="message",
+                text_stream=text_ch,
+                audio_stream=audio_ch,
+                modalities=modalities,
+            )
+        )
+        message_ch.close()
+        (await _next_reply(model)).set_result(
+            GenerationCreatedEvent(
+                message_stream=message_ch,
+                function_stream=function_ch,
+                user_initiated=True,
+                response_id="response",
+            )
+        )
+        await asyncio.sleep(0.1)
+        reply.interrupt(force=True)
+        for ch in (function_ch, text_ch, audio_ch):
+            ch.close()
+        await asyncio.wait_for(reply, timeout=10)
+
+    [turn] = _spans(span_exporter, "agent_turn")
+    attrs = turn.attributes or {}
+    assert attrs[trace_types.ATTR_SPEECH_INTERRUPTED] is True
+    assert trace_types.ATTR_PLAYOUT_POSITION not in attrs
