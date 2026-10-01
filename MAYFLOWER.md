@@ -65,14 +65,14 @@ repository settings.
 
 ## What is patched
 
-Twenty-four commits in nineteen entries against nine defect classes: **a finished
+Twenty-five commits in twenty entries against nine defect classes: **a finished
 tool result never reaching the caller** (1–4), **a Gemini session dropped for no
 reason** (5–6, 12), **a finished reply the session will not let out** (7, 13),
 **a caller transcript that is not the one the session asked for** (8, 11, 14),
 **a prompt change the model never takes as its instruction** (15), **a billed
 token nobody counts** (9), **a request the provider is given nothing to
 answer** (10), **a spoken sentence the trace loses** (16), and **a turn the
-trace times wrong** (17–19). Read this before
+trace times wrong** (17–20). Read this before
 porting them to a new release — a clean `git rebase` says the text still
 applies, not that the reasoning does.
 
@@ -609,29 +609,20 @@ The pipeline writer had entry 16's blind spot: it summed the segments of the
 step that was cut. A turn whose first reply played out before a tool call and
 whose follow-up was then cut reported only the follow-up's share.
 
-Both now go through `_record_playout_position`. It appends each generation's
-per-segment `playback_position` to the speech handle (`_played_audio`) and,
-once the speech is interrupted, writes the sum. The shape is
-`_record_response_text`'s, except that nothing stored on the chat items says
-how long a message played, so the handle keeps the list. Only a turn's last
+Both now go through `_record_playout_position`, which appends each
+generation's per-segment `playback_position` to the speech handle
+(`_played_audio`). The sum is written when the span closes, in
+`SpeechHandle._end_agent_turn` (entry 20), if the speech was interrupted. The
+shape is `_record_response_text`'s, except that nothing stored on the chat items
+says how long a message played, so the handle keeps the list. Only a turn's last
 generation can be cut — an interrupted step schedules no follow-up — so the
-earlier ones count with their full playout. The early returns of an interrupted
-step call it too, so a follow-up cut before it forwards anything still reports
-what the generations before it played. A segment that never reached the
-speakers (`played == "skipped"`) adds nothing, so a turn that played nothing
-gets no attribute where upstream's pipeline wrote `0.0`: an absent position
-means nothing was heard. The `say()` writer is left alone: a `say()` handle
-never takes a second step.
-
-Not covered: an interruption that lands between two generations — while a tool
-runs, or while `_realtime_reply_task` waits for the follow-up's response — never
-reaches the span. The handle is interrupted and its follow-up dropped, but the
-span keeps the `lk.interrupted=False` its last generation wrote, with no source
-and no position: both are written only from inside a generation, and
-`SpeechHandle._end_agent_turn` closes the span without reading `interrupted`.
-Probed on the realtime path, with and without `auto_tool_reply_generation`, it
-hits every caller who talks over a running lookup. The fix belongs in
-`_end_agent_turn`.
+earlier ones count with their full playout, and a follow-up cut before it
+forwards anything, or a cut while a tool runs, still reports what the
+generations before it played. A segment that never reached the speakers
+(`played == "skipped"`) adds nothing, so a turn that played nothing gets no
+attribute where upstream's pipeline wrote `0.0`: an absent position means
+nothing was heard. The `say()` writer is left alone: a `say()` handle never
+takes a second step.
 
 *Porting checks:* does the realtime path still compute `playback_position` per
 message and write no position itself? Does `_agent_turn` still continue one
@@ -688,6 +679,42 @@ said. Upstream `main` has the same code, so this is a PR of its own.
 
 *Porting checks:* does `wait_for_playout` still return the last event when
 nothing new was captured? Has upstream guarded the fully played branch?
+
+### 20. A cut between two generations leaves the turn uninterrupted
+
+*Files: `livekit-agents/.../voice/speech_handle.py`,
+`livekit-agents/.../voice/agent_activity.py`*
+
+`lk.interrupted`, `lk.interruption.source` and, since entry 17,
+`lk.playout.position` were written only from inside a generation. A caller who
+talks while a tool runs cuts the turn between two: the handle waits in
+`_background_speeches`, the barge-in interrupts it, and the follow-up never
+starts. The realtime `_realtime_reply_task` returns before it reaches
+`_agent_turn`, and the pipeline schedules no tool reply at all. The span kept
+the `lk.interrupted=False` its first generation wrote, with no source and no
+position. Probed on both paths, and with and without
+`auto_tool_reply_generation`, it hits every caller who talks over a running
+lookup.
+
+`SpeechHandle._end_agent_turn`, which closes the span whatever step the speech
+was on, now writes all three when the handle is interrupted: `True`, the source
+(`_interrupt_source`, `"programmatic"` when unset, as `_record_interruption`
+does), and the sum of `_played_audio`. It only ever adds. `interrupted` is the
+state of the interrupt future and cannot revert, and every generation writer
+sets `True` only when it was set, so nothing written earlier is weakened. A turn
+that was not interrupted keeps the `False` its generations wrote, and `say()`
+keeps the position it writes itself, since it fills no `_played_audio`.
+
+The pipeline probe also showed a mislabel: `_user_turn_completed_impl`
+interrupted the background speeches without a source, so a turn cut by a
+committed user turn read `programmatic`. It now passes `user_turn`, as the same
+function already does for the current speech.
+
+*Porting checks:* does `_end_agent_turn` still close the span for every path?
+Do the generation writers still set `lk.interrupted=True` only when the handle
+is interrupted? Does a tool-running speech still sit in `_background_speeches`
+where a barge-in reaches it? If upstream records the interruption at span end
+itself, drop this.
 
 ## Verifying a port
 
