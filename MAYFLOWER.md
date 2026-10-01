@@ -65,14 +65,14 @@ repository settings.
 
 ## What is patched
 
-Nineteen commits in eighteen entries against nine defect classes: **a finished
+Twenty-four commits in nineteen entries against nine defect classes: **a finished
 tool result never reaching the caller** (1–4), **a Gemini session dropped for no
 reason** (5–6, 12), **a finished reply the session will not let out** (7, 13),
 **a caller transcript that is not the one the session asked for** (8, 11, 14),
 **a prompt change the model never takes as its instruction** (15), **a billed
 token nobody counts** (9), **a request the provider is given nothing to
 answer** (10), **a spoken sentence the trace loses** (16), and **a turn the
-trace times wrong** (17, 18). Read this before
+trace times wrong** (17–19). Read this before
 porting them to a new release — a clean `git rebase` says the text still
 applies, not that the reasoning does.
 
@@ -615,13 +615,23 @@ once the speech is interrupted, writes the sum. The shape is
 `_record_response_text`'s, except that nothing stored on the chat items says
 how long a message played, so the handle keeps the list. Only a turn's last
 generation can be cut — an interrupted step schedules no follow-up — so the
-earlier ones count with their full playout. A turn interrupted before any
-generation forwarded audio still gets no attribute. The `say()` writer is left
-alone: a `say()` handle never takes a second step.
+earlier ones count with their full playout. The early returns of an interrupted
+step call it too, so a follow-up cut before it forwards anything still reports
+what the generations before it played. A segment that never reached the
+speakers (`played == "skipped"`) adds nothing, so a turn that played nothing
+gets no attribute where upstream's pipeline wrote `0.0`: an absent position
+means nothing was heard. The `say()` writer is left alone: a `say()` handle
+never takes a second step.
 
-Not covered: a follow-up generation interrupted while it waits for
-authorization returns before it forwards anything, on both paths, and writes no
-position even when the generation before it played.
+Not covered: an interruption that lands between two generations — while a tool
+runs, or while `_realtime_reply_task` waits for the follow-up's response — never
+reaches the span. The handle is interrupted and its follow-up dropped, but the
+span keeps the `lk.interrupted=False` its last generation wrote, with no source
+and no position: both are written only from inside a generation, and
+`SpeechHandle._end_agent_turn` closes the span without reading `interrupted`.
+Probed on the realtime path, with and without `auto_tool_reply_generation`, it
+hits every caller who talks over a running lookup. The fix belongs in
+`_end_agent_turn`.
 
 *Porting checks:* does the realtime path still compute `playback_position` per
 message and write no position itself? Does `_agent_turn` still continue one
@@ -642,10 +652,11 @@ about a millisecond for a turn nobody spoke.
 
 The claim now passes `claimed=True` and takes the state without the span; the
 state, its events and the idle hold are unchanged. The span is the user's voice,
-and speech can start inside a claim, where the state does not change. So the
-span is now opened before the same-state early return, and ended only on a
-change away from `"speaking"`. Before, such speech was folded into the claim's
-span and dated from the moment the text arrived.
+and speech can start and stop inside a claim, where the state does not change.
+So the span is opened before the same-state early return and ended on a voice
+stop before the claim's pin returns: each utterance inside a claim gets its own
+span. Before, all of it was folded into one span that started when the text
+arrived and ended when the claim was released.
 
 Every other caller passes no flag: the VAD hooks, the realtime speech handlers,
 and the claim's own release, which re-derives the state from
@@ -656,6 +667,27 @@ one.
 `"speaking"` without audio? Does `_update_user_state` still own the
 `user_speaking` span? If upstream gives a text turn a span of its own, or stops
 claiming it, drop this.
+
+### 19. A segment that plays no audio reports the previous one's playout
+
+*Files: `livekit-agents/.../voice/generation.py`*
+
+`AudioOutput.wait_for_playout()` waits for the segments captured so far and
+returns the last `PlaybackFinishedEvent` — the previous segment's, when the
+current one captured no frame. `forward_generation`'s interrupted branch
+already guards against that (`captured_playout_segments >
+captured_segments_before`); the fully played branch did not. A segment with no
+audio, such as a realtime message without an audio part, came back
+`played == "full"` with the previous segment's `playback_position` and
+`synchronized_transcript`. Summed per turn since entry 17, that counted a
+played segment twice.
+
+The fully played branch now takes both from its own segment only, and leaves
+`0.0` and `None` otherwise. `played` stays `"full"`, so the text still counts as
+said. Upstream `main` has the same code, so this is a PR of its own.
+
+*Porting checks:* does `wait_for_playout` still return the last event when
+nothing new was captured? Has upstream guarded the fully played branch?
 
 ## Verifying a port
 
