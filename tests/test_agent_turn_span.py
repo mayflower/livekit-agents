@@ -165,6 +165,43 @@ async def test_turn_text_is_what_every_generation_said(
 
 
 @pytest.mark.virtual_time
+async def test_pipeline_playout_position_counts_every_step(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.0, "What's the weather in Tokyo?")
+    actions.add_llm(
+        content="Let me check.",
+        tool_calls=[
+            FunctionToolCall(name="get_weather", arguments='{"location": "Tokyo"}', call_id="1")
+        ],
+    )
+    actions.add_tts(0.5)
+    actions.add_llm(content="It is sunny in Tokyo, and tomorrow ...", input="sunny in Tokyo")
+    actions.add_tts(10.0)  # playout starts at ~3.5s
+    actions.add_user_speech(6.0, 7.0, "Thanks!", stt_delay=0.2)  # barge-in at ~6.5s
+
+    session = create_session(actions)
+    assert session.output.audio is not None
+    played: list[float] = []
+    session.output.audio.on("playback_finished", lambda ev: played.append(ev.playback_position))
+    await asyncio.wait_for(run_session(session, _WeatherAgent(), drain_delay=1.0), timeout=60)
+
+    cut = [
+        s
+        for s in _spans(span_exporter, "agent_turn")
+        if (s.attributes or {}).get(trace_types.ATTR_SPEECH_INTERRUPTED) is True
+    ]
+    [turn] = cut
+    first_step, cut_step = played[:2]
+    assert first_step == pytest.approx(0.5, abs=0.05)
+    assert 0.5 < cut_step < 10.0
+    assert (turn.attributes or {})[trace_types.ATTR_PLAYOUT_POSITION] == pytest.approx(
+        first_step + cut_step
+    )
+
+
+@pytest.mark.virtual_time
 async def test_realtime_turn_text_is_what_every_generation_said(
     span_exporter: InMemorySpanExporter,
 ) -> None:
@@ -187,6 +224,8 @@ async def test_realtime_turn_text_is_what_every_generation_said(
     assert (turn.attributes or {})[trace_types.ATTR_RESPONSE_TEXT] == (
         "Let me check.\nIt is sunny in Tokyo."
     )
+    # played out in full: a position belongs to a cut
+    assert trace_types.ATTR_PLAYOUT_POSITION not in (turn.attributes or {})
 
 
 @pytest.mark.virtual_time
