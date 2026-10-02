@@ -1120,6 +1120,9 @@ class RealtimeSession(llm.RealtimeSession):
                     model=self._opts.model, config=config
                 ) as session:
                     self._report_connection_acquired(time.perf_counter() - t0)
+                    reconnected = self._connected_once
+                    # the service refuses a handle it cannot resume, so this one resumed
+                    resumed = self._session_resumption_handle is not None
                     self._connected_once = True
                     # the speech the old connection ended is not what this one answers
                     self._input_speech_stopped_at = None
@@ -1127,7 +1130,7 @@ class RealtimeSession(llm.RealtimeSession):
                         self._active_session = session
 
                         pending_ctx, self._pending_chat_ctx = self._pending_chat_ctx, None
-                        if self._session_resumption_handle is not None:
+                        if resumed:
                             # the handle restores the conversation; send only what came after it
                             target = pending_ctx if pending_ctx is not None else self._chat_ctx
                             if self._resumption_chat_ctx is None:
@@ -1178,6 +1181,17 @@ class RealtimeSession(llm.RealtimeSession):
                                     turn_complete=bool(stranded.turn_complete),
                                 )
                             self._unsent_item_ids.clear()
+
+                    if reconnected:
+                        self.emit(
+                            "session_reconnected",
+                            llm.RealtimeSessionReconnectedEvent(
+                                resumed=resumed,
+                                # the caller's turn ends with the generation that answers
+                                # it, on this connection as on the last
+                                speech_stop_follows=True,
+                            ),
+                        )
 
                     # queue up existing chat context
                     send_task = asyncio.create_task(

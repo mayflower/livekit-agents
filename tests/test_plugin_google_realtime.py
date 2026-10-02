@@ -1647,3 +1647,128 @@ async def test_voice_activity_leaves_the_turn_taking_alone(
     # as for any reply the service starts: the playout stop ahead of it, the generation, and
     # the stop once it is done
     assert seen.events == ["input_speech_started", "generation_created", "input_speech_stopped"]
+
+
+# --- reconnects ---------------------------------------------------------------
+#
+# The plugin replaces its connection on `go_away`, on an error and on an option change,
+# resuming through the last handle, and fresh from `reconnect()`.
+
+_INTERRUPTED = types.LiveServerMessage(server_content=types.LiveServerContent(interrupted=True))
+_CALLER_AGAIN = types.LiveServerMessage(
+    server_content=types.LiveServerContent(
+        input_transcription=types.Transcription(text="Wie geht's?")
+    )
+)
+_REPLY_AGAIN = types.LiveServerMessage(
+    server_content=_audio_content(output_transcription=types.Transcription(text="Gut, danke."))
+)
+
+
+def _reconnect(session: RealtimeSession, *, resume: bool) -> None:
+    if resume:
+        session._session_resumption_handle = "resume-1"
+        session._mark_restart_needed()
+    else:
+        session.reconnect()
+
+
+@pytest.mark.parametrize("resume", [True, False])
+async def test_a_reconnect_says_so_and_whether_the_service_resumed_it(
+    monkeypatch: pytest.MonkeyPatch, resume: bool
+) -> None:
+    """The other realtime plugins emit `session_reconnected`; this one never did.
+
+    The service refuses a handle it cannot resume, so a connection that opened with one
+    has resumed the session.
+    """
+    first, second = _FakeLiveSession(), _FakeLiveSession()
+    async with _connected_session(monkeypatch, handle=None, sockets=[first, second]) as (
+        session,
+        _,
+    ):
+        seen: list[llm.RealtimeSessionReconnectedEvent] = []
+        session.on("session_reconnected", seen.append)
+        await asyncio.sleep(0.05)
+        assert seen == []  # the first connection is no reconnect
+
+        _reconnect(session, resume=resume)
+        await _until(lambda: len(seen) == 1)
+
+    [reconnected] = seen
+    assert reconnected.resumed is resume
+    assert reconnected.speech_stop_follows is True
+
+
+@pytest.mark.parametrize("cut_mid_reply", [False, True], ids=["between_turns", "mid_reply"])
+@pytest.mark.parametrize("resume", [True, False], ids=["resumed", "fresh"])
+async def test_no_turn_is_lost_or_doubled_across_a_reconnect(
+    monkeypatch: pytest.MonkeyPatch, resume: bool, cut_mid_reply: bool
+) -> None:
+    first, second = _ScriptedLiveSession(), _ScriptedLiveSession()
+    async with _connected_session(monkeypatch, handle=None, sockets=[first, second]) as (
+        session,
+        _,
+    ):
+        seen = _Seen(session)
+        reconnects: list[object] = []
+        session.on("session_reconnected", reconnects.append)
+        first.deliver(_CALLER, _REPLY, *([] if cut_mid_reply else [_DONE]))
+        await _until(
+            lambda: (
+                seen.stops() == (0 if cut_mid_reply else 1)
+                and session._current_generation is not None
+                and session._current_generation.has_output
+            )
+        )
+
+        _reconnect(session, resume=resume)
+        await _until(lambda: session._active_session is second)
+        second.deliver(_CALLER_AGAIN, _REPLY_AGAIN, _DONE)
+        await _until(lambda: seen.stops() == 2)
+        await asyncio.sleep(0.05)
+
+    assert len(reconnects) == 1
+    assert seen.events == ["input_speech_started", "generation_created", "input_speech_stopped"] * 2
+    assert [item.text_content for item in session.chat_ctx.items] == [
+        "Hallo.",
+        "Guten Tag!",
+        "Wie geht's?",
+        "Gut, danke.",
+    ]
+    # the handle restores the conversation; a fresh connection has it replayed, once
+    assert _texts(second.sent) == ([] if resume else [["Hallo.", "Guten Tag!"]])
+
+
+async def test_a_barge_in_after_the_reply_finished_is_still_ended_after_a_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Its stop comes when the next generation is done, on whichever connection.
+
+    An `interrupted` with no generation open -- the reply is done, its audio still
+    playing -- starts a user turn that nothing ends until then. A reconnect in between
+    must leave it open, or a queued reply plays over the caller.
+    """
+    first, second = _ScriptedLiveSession(), _ScriptedLiveSession()
+    async with _connected_session(monkeypatch, handle=None, sockets=[first, second]) as (
+        session,
+        _,
+    ):
+        seen = _Seen(session)
+        detected: list[bool] = []
+        session.on("input_speech_started", lambda ev: detected.append(ev.speech_detected))
+        reconnects: list[llm.RealtimeSessionReconnectedEvent] = []
+        session.on("session_reconnected", reconnects.append)
+        first.deliver(_REPLY, _DONE, _INTERRUPTED)
+        await _until(lambda: detected == [False, True])
+
+        _reconnect(session, resume=True)
+        await _until(lambda: session._active_session is second)
+        await asyncio.sleep(0.05)
+        # the reply's own stop only: the caller's turn is still open
+        assert seen.stops() == 1
+        [reconnected] = reconnects
+        assert reconnected.speech_stop_follows is True
+
+        second.deliver(_CALLER, _REPLY_AGAIN, _DONE)
+        await _until(lambda: seen.stops() == 2)
