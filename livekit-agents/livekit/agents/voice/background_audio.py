@@ -358,7 +358,9 @@ class BackgroundAudioPlayer:
                 # republished it during a full reconnect; resolve the current
                 # publication by track name before unpublishing.
                 current = self._find_publication_by_name(_TRACK_NAME)
-                if current is not None:
+                # A disconnected room never answers an unpublish: its event listener has
+                # stopped, so the FFI reply is never delivered and the call waits forever.
+                if current is not None and self._room.isconnected():
                     await self._room.local_participant.unpublish_track(current.sid)
 
     def _find_publication_by_name(self, name: str) -> rtc.LocalTrackPublication | None:
