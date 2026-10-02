@@ -20,7 +20,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from livekit import rtc
-from livekit.agents import Agent, AgentSession, JobContext
+from livekit.agents import Agent, AgentSession, JobContext, llm
 from livekit.agents.ipc.job_proc_lazy_main import (
     _callback_name,
     _record_dispatch_timeline,
@@ -31,6 +31,7 @@ from livekit.agents.job import AutoSubscribe, JobAcceptArguments, RunningJobInfo
 from livekit.agents.telemetry import session_context, set_tracer_provider, trace_types, tracer
 from livekit.protocol import agent as agent_proto
 
+from .fake_realtime import FakeRealtimeModel
 from .fake_session import FakeActions, create_session, run_session
 from .trace_schema import assert_trace_well_formed
 
@@ -510,3 +511,24 @@ async def test_session_lifecycle_spans_and_events(span_exporter: InMemorySpanExp
     assert any((e.attributes or {})[trace_types.ATTR_NEW_STATE] == "speaking" for e in user_states)
     # the whole tree, not just the edges this test names (tests/trace_schema.py)
     assert_trace_well_formed(span_exporter.get_finished_spans())
+
+
+@pytest.mark.parametrize("resumed", [True, False, None])
+async def test_a_realtime_reconnect_is_an_event_of_the_session(
+    span_exporter: InMemorySpanExporter, resumed: bool | None
+) -> None:
+    """A new provider connection is where the model's memory may start over.
+
+    A session that replays the conversation into a new connection leaves its tool calls
+    out, and one that resumes keeps everything; either way it showed nowhere in the trace.
+    """
+    model = FakeRealtimeModel()
+    async with AgentSession(llm=model) as session:
+        await session.start(Agent(instructions="test"))
+        model.active_session.emit(
+            "session_reconnected", llm.RealtimeSessionReconnectedEvent(resumed=resumed)
+        )
+
+    [root] = _spans(span_exporter, "agent_session")
+    [event] = [e for e in root.events if e.name == "realtime_session_reconnected"]
+    assert (event.attributes or {}).get(trace_types.ATTR_SESSION_RESUMED) == resumed

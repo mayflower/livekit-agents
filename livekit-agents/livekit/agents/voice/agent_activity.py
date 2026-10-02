@@ -1225,6 +1225,7 @@ class AgentActivity(RecognitionHooks):
                         self._on_input_audio_transcription_completed,
                     )
                     self._rt_session.off("metrics_collected", self._on_metrics_collected)
+                    self._rt_session.off("session_reconnected", self._trace_session_reconnected)
                     self._rt_session.off("remote_item_added", self._on_remote_item_added)
                     self._rt_session.off("error", self._on_error)
                     if isinstance(self._rt_session, _FallbackRealtimeSession):
@@ -1335,6 +1336,7 @@ class AgentActivity(RecognitionHooks):
                 self._on_input_audio_transcription_completed,
             )
             self._rt_session.on("metrics_collected", self._on_metrics_collected)
+            self._rt_session.on("session_reconnected", self._trace_session_reconnected)
             self._rt_session.on("remote_item_added", self._on_remote_item_added)
             self._rt_session.on("error", self._on_error)
 
@@ -1662,6 +1664,7 @@ class AgentActivity(RecognitionHooks):
                 "input_audio_transcription_completed",
                 self._on_input_audio_transcription_completed,
             )
+            self._rt_session.off("session_reconnected", self._trace_session_reconnected)
             self._rt_session.off("remote_item_added", self._on_remote_item_added)
             self._rt_session.off("error", self._on_error)
             if isinstance(self._rt_session, _FallbackRealtimeSession):
@@ -2250,6 +2253,14 @@ class AgentActivity(RecognitionHooks):
             "session_usage_updated",
             SessionUsageUpdatedEvent(usage=self._session.usage),
         )
+
+    def _trace_session_reconnected(self, ev: object) -> None:
+        # where what the model remembers may start over: a replay leaves tool calls out.
+        # Read defensively, as adapters forward whatever the session they wrap emitted.
+        attrs: dict[str, bool] = {}
+        if (resumed := getattr(ev, "resumed", None)) is not None:
+            attrs[trace_types.ATTR_SESSION_RESUMED] = resumed
+        self._session._add_session_event("realtime_session_reconnected", attrs)
 
     def _on_remote_item_added(self, ev: llm.RemoteItemAddedEvent) -> None:
         # add the remote item to the local chat context as a placeholder

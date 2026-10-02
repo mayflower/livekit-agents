@@ -215,7 +215,10 @@ class InputTranscriptionCompleted:
 
 @dataclass
 class RealtimeSessionReconnectedEvent:
-    pass
+    resumed: bool | None = None
+    """Whether the provider resumed the previous session, keeping the conversation on its
+    side, rather than opening one the session replays the conversation into; None unless
+    the provider says so"""
 
 
 @dataclass

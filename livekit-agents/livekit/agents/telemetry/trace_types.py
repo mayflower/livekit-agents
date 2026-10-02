@@ -175,6 +175,8 @@ ATTR_TTS_METRICS = "lk.tts_metrics"
 ATTR_REALTIME_MODEL_METRICS = "lk.realtime_model_metrics"
 ATTR_INPUT_SPEECH_STOPPED_AT = "lk.input_speech_stopped_at"
 """On ``realtime_inference``: when the provider's turn detection ended the speech it answers."""
+ATTR_SESSION_RESUMED = "lk.session_resumed"
+"""On a ``realtime_session_reconnected`` event: whether the provider resumed the session."""
 
 # latency span attributes
 ATTR_E2E_LATENCY = "lk.e2e_latency"
