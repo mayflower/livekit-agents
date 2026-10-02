@@ -10,15 +10,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import Awaitable, Callable
 
 import pytest
 
 from livekit import rtc
-from livekit.agents import tokenize
+from livekit.agents import Agent, AgentSession, tokenize, utils
+from livekit.agents.llm import FunctionCall, GenerationCreatedEvent, MessageGeneration
 from livekit.agents.voice.io import PlaybackFinishedEvent
 from livekit.agents.voice.transcription.synchronizer import TranscriptSynchronizer
 
 from .fake_io import FakeAudioOutput
+from .fake_realtime import FakeRealtimeModel, fake_capabilities
 
 pytestmark = [pytest.mark.unit, pytest.mark.virtual_time]
 
@@ -27,6 +30,15 @@ SAMPLE_RATE = 24000
 # 22 hyphens in 3.5s: 6.3/s against the default 3.83/s
 REPLY = "Sure, the weekend in Berlin stays sunny and dry, with highs of up to twenty-six degrees."
 RATE = 22 / 3.5
+
+# the shape of a cut measured on a realtime call: 22 hyphens in 3.76s, then the rest of an
+# answer of 10s in all
+WEATHER = (
+    "Klar, in Würzburg wird es am Wochenende sonnig und trocken, mit Temperaturen bis zu 26 "
+    "Grad. Am Sonntag ziehen am Nachmittag ein paar Wolken auf, es bleibt aber trocken und "
+    "warm. Soll ich dir auch noch die Vorhersage für die kommende Woche heraussuchen?"
+)
+WEATHER_RATE = 22 / 3.76
 
 
 def _frame(duration: float) -> rtc.AudioFrame:
@@ -56,13 +68,16 @@ class _Turn:
         await self.audio.capture_frame(_frame(audio))
 
     async def stream(self, text: str, *, in_step: bool) -> None:
-        """Push a reply word by word, its text just ahead of its audio, at 2.8x real time."""
-        for i, word in enumerate(text.split(" ")):
-            seconds = _hyphens(word) / RATE
-            await self.push(word if i == 0 else f" {word}", audio=seconds)
-            if i == 0 and in_step:
+        first = True
+
+        async def push(word: str, seconds: float) -> None:
+            nonlocal first
+            await self.push(word, audio=seconds)
+            if first and in_step:
                 self.audio.mark_transcript_in_step()
-            await asyncio.sleep(seconds / 2.8)
+            first = False
+
+        await _stream(text, rate=RATE, push=push)
         self.end_generation()
 
     def end_generation(self) -> None:
@@ -81,6 +96,15 @@ class _Turn:
         transcript = self.finished[0].synchronized_transcript
         assert transcript is not None
         return transcript
+
+
+async def _stream(text: str, *, rate: float, push: Callable[[str, float], Awaitable[None]]) -> None:
+    """Push a reply word by word, each word's text just ahead of its audio, at 2.8x real time,
+    as a realtime model generates them."""
+    for i, word in enumerate(text.split(" ")):
+        seconds = _hyphens(word) / rate
+        await push(word if i == 0 else f" {word}", seconds)
+        await asyncio.sleep(seconds / 2.8)
 
 
 async def _cut_mid_stream(text: str, *, at: float, in_step: bool) -> str:
@@ -165,3 +189,102 @@ async def test_a_turn_played_to_its_end_keeps_its_whole_text(cut_at_the_end: boo
         assert turn.transcript() == reply
     finally:
         await turn.sync.aclose()
+
+
+async def _realtime_cut(*, at: float, server_cancels_first: bool, in_step: bool = True) -> str:
+    """Cut a realtime reply ``at`` seconds into its playout while the model still streams it."""
+    model = FakeRealtimeModel(capabilities=fake_capabilities(audio_transcript_in_step=in_step))
+    sink = FakeAudioOutput()
+    sync = TranscriptSynchronizer(next_in_chain_audio=sink, next_in_chain_text=None)
+    text_ch, audio_ch = utils.aio.Chan[str](), utils.aio.Chan[rtc.AudioFrame]()
+
+    async def push(word: str, seconds: float) -> None:
+        text_ch.send_nowait(word)
+        audio_ch.send_nowait(_frame(seconds))
+
+    async with AgentSession(llm=model) as session:
+        session.output.audio = sync.audio_output
+        session.output.transcription = sync.text_output
+        await session.start(Agent(instructions="You are a helpful assistant."))
+
+        reply = session.generate_reply()
+        while not model.active_session._reply_futs:
+            await asyncio.sleep(0)
+        message_ch = utils.aio.Chan[MessageGeneration]()
+        function_ch = utils.aio.Chan[FunctionCall]()
+        modalities = asyncio.Future[list[str]]()
+        modalities.set_result(["audio", "text"])
+        message_ch.send_nowait(
+            MessageGeneration(
+                message_id="message-id",
+                text_stream=text_ch,
+                audio_stream=audio_ch,
+                modalities=modalities,
+            )
+        )
+        message_ch.close()
+        function_ch.close()
+        model.active_session._reply_futs[0].set_result(
+            GenerationCreatedEvent(
+                message_stream=message_ch,
+                function_stream=function_ch,
+                user_initiated=True,
+                response_id="response-id",
+            )
+        )
+
+        streaming = asyncio.create_task(_stream(WEATHER, rate=WEATHER_RATE, push=push))
+        while sink._started_at is None:
+            await asyncio.sleep(0)
+        await asyncio.sleep(at)
+        assert not streaming.done(), "the reply finished streaming before the cut"
+        streaming.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await streaming
+
+        if server_cancels_first:
+            # the server's own turn detection cancels the response: its response.done closes
+            # the streams before the local interruption cancels the forwarding
+            text_ch.close()
+            audio_ch.close()
+            await asyncio.sleep(0.05)
+        reply.interrupt(force=True)
+        await asyncio.wait_for(reply, timeout=10)
+    await sync.aclose()
+
+    # a cut that kept no text stores no message
+    texts = [item.text_content for item in reply.chat_items if item.type == "message"]
+    return texts[0] or "" if texts else ""
+
+
+@pytest.mark.parametrize("server_cancels_first", [False, True])
+@pytest.mark.parametrize(
+    ("at", "played"),
+    [
+        (0.2, "Klar, in"),  # 1.2 hyphens: "in" started at 0.17s
+        (2.8, "Klar, in Würzburg wird es am Wochenende sonnig und trocken, mit Temperaturen"),
+    ],
+)
+async def test_a_realtime_cut_mid_stream_keeps_the_words_its_audio_played(
+    at: float, played: str, server_cancels_first: bool
+) -> None:
+    transcript = await _realtime_cut(at=at, server_cancels_first=server_cancels_first)
+
+    assert WEATHER.startswith(transcript)
+    assert abs(len(transcript.split()) - len(played.split())) <= 1, transcript
+
+
+@pytest.mark.parametrize(
+    ("at", "paced"),
+    [
+        (0.2, ""),  # "Klar," takes 0.26s at the default pace
+        (2.8, "Klar, in Würzburg wird es am Wochenende sonnig"),  # 10.7 hyphens, 4 words short
+    ],
+)
+async def test_a_realtime_model_without_an_in_step_transcript_keeps_the_paced_text(
+    at: float, paced: str
+) -> None:
+    transcript = await _realtime_cut(at=at, server_cancels_first=False, in_step=False)
+
+    assert WEATHER.startswith(transcript)
+    assert len(transcript.split()) <= len(paced.split()), transcript

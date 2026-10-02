@@ -125,6 +125,8 @@ class RealtimeModel(openai.realtime.RealtimeModel):
         self._capabilities.can_disable_turn_detection = False
         # xAI force_message drives scripted TTS without a follow-up response.create
         self._capabilities.supports_say = True
+        # not checked against xAI's streams
+        self._capabilities.audio_transcript_in_step = False
         self._provider_label = "xAI Realtime API"
 
     def session(self, *, turn_detection_disabled: bool = False) -> RealtimeSession:

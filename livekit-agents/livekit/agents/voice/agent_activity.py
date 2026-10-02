@@ -4594,6 +4594,7 @@ class AgentActivity(RecognitionHooks):
             """Resolve a message's audio/text sources, then forward and wait for playout."""
             nonlocal read_transcript_from_tts
             assert isinstance(self.llm, llm.RealtimeModel)
+            assert self._rt_session is not None
 
             msg_modalities = await msg.modalities
             tts_text_input: AsyncIterable[str] | None = None
@@ -4609,6 +4610,7 @@ class AgentActivity(RecognitionHooks):
                 tr_text_input = msg.text_stream.__aiter__()
 
             audio_source: AsyncIterable[rtc.AudioFrame] | None = None
+            transcript_in_step = False
             if audio_output is not None:
                 if tts_text_input is not None:
                     tts_task, tts_gen_data = perform_tts_inference(
@@ -4640,6 +4642,8 @@ class AgentActivity(RecognitionHooks):
                         if asyncio.iscoroutine(realtime_audio)
                         else realtime_audio
                     )
+                    # the session's, which a fallback adapter reports for the model in use
+                    transcript_in_step = self._rt_session.capabilities.audio_transcript_in_step
                 elif self.llm.capabilities.audio_output:
                     logger.error(
                         "Text message received from Realtime API with audio modality. "
@@ -4662,6 +4666,7 @@ class AgentActivity(RecognitionHooks):
                 text_source=text_source,
                 on_first_frame=_on_first_frame,
                 reconcile_playout_pause=lambda: self._reconcile_playout_pause(speech_handle),
+                transcript_in_step=transcript_in_step,
             )
             return _MsgOutput(msg=msg, out=out)
 

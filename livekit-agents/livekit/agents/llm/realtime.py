@@ -100,6 +100,10 @@ class RealtimeCapabilities:
     When used through a RealtimeModel, add_to_chat_ctx=False is ignored and the
     message is still added to the chat context.
     """
+    audio_transcript_in_step: bool = False
+    """Whether the transcript of the model's audio streams in step with the audio, each part
+    arriving with the speech it transcribes. A cut can then tell from the text and audio that
+    have arrived how far the caller heard, while the reply is still streaming"""
 
 
 class RealtimeError(Exception):

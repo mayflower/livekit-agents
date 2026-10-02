@@ -591,6 +591,7 @@ def perform_audio_forwarding(
     audio_output: io.AudioOutput,
     tts_output: AsyncIterable[rtc.AudioFrame],
     reconcile_playout_pause: Callable[[], None],
+    transcript_in_step: bool = False,
 ) -> tuple[asyncio.Task[None], _AudioOutput]:
     out = _AudioOutput(
         first_frame_fut=asyncio.Future(),
@@ -600,6 +601,9 @@ def perform_audio_forwarding(
     def _on_playback_started(ev: io.PlaybackStartedEvent) -> None:
         if out.has_captured_own_frame and not out.first_frame_fut.done():
             out.first_frame_fut.set_result(ev.created_at)
+            if transcript_in_step:
+                # marked once it plays, when the outputs hold this segment and no earlier one
+                audio_output.mark_transcript_in_step()
 
     # out.first_frame_fut should be cancelled in the caller after the playout is finished or interrupted
     audio_output.on("playback_started", _on_playback_started)
@@ -704,13 +708,15 @@ async def forward_generation(
     text_source: AsyncIterable[str] | None,
     on_first_frame: Callable[[asyncio.Future[Any], _AudioOutput | None], None],
     reconcile_playout_pause: Callable[[], None],
+    transcript_in_step: bool = False,
 ) -> _ForwardOutput:
     """Forward one segment's audio/text to the outputs, then wait for its playout.
 
     Returns when the segment has fully played, been interrupted, or never started
     (e.g. interrupted before the first frame). Callers resolve the audio/text sources
     and own message creation; this is the shared core between the pipeline and realtime
-    generation paths.
+    generation paths. ``transcript_in_step`` says the text streams with the audio it
+    transcribes (see ``AudioOutput.mark_transcript_in_step``).
     """
     out = _ForwardOutput()
     forward_tasks: list[asyncio.Task[Any]] = []
@@ -721,6 +727,7 @@ async def forward_generation(
                 audio_output=audio_output,
                 tts_output=audio_source,
                 reconcile_playout_pause=reconcile_playout_pause,
+                transcript_in_step=transcript_in_step,
             )
             forward_tasks.append(forward_audio_task)
             audio_out.first_frame_fut.add_done_callback(lambda fut: on_first_frame(fut, audio_out))

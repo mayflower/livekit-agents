@@ -490,6 +490,8 @@ class RealtimeModel(llm.RealtimeModel):
                 mutable_instructions=True,
                 mutable_tools=True,
                 per_response_tool_choice=True,
+                # an item's transcript and audio deltas are sent as they are generated
+                audio_transcript_in_step=True,
             )
         )
 
