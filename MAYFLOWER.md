@@ -32,10 +32,11 @@ keeping it there is also what keeps it out of the diff an upstream PR would show
 `livekit-agent/pyproject.toml` under `[tool.uv.sources]`. Rev, not branch name:
 a moving ref would break `uv sync --locked`.
 
-Only `livekit-agents` and `livekit-plugins-google` are changed. uv resolves every
-sibling plugin out of this repo's workspace rather than PyPI — a workspace member
-wins over an `{ index = "pypi" }` source — which is what carries the Google fixes,
-and is harmless for the rest, since they are the monorepo's own unmodified release.
+Only `livekit-agents` and the `google`, `openai` and `xai` plugins are changed. uv
+resolves every sibling plugin out of this repo's workspace rather than PyPI — a
+workspace member wins over an `{ index = "pypi" }` source — which is what carries
+the plugin fixes, and is harmless for the rest, since they are the monorepo's own
+unmodified release.
 
 ## Moving to a newer upstream release
 
@@ -65,13 +66,13 @@ repository settings.
 
 ## What is patched
 
-Twenty-five commits in twenty entries against nine defect classes: **a finished
+Twenty-seven commits in twenty-one entries against nine defect classes: **a finished
 tool result never reaching the caller** (1–4), **a Gemini session dropped for no
 reason** (5–6, 12), **a finished reply the session will not let out** (7, 13),
 **a caller transcript that is not the one the session asked for** (8, 11, 14),
 **a prompt change the model never takes as its instruction** (15), **a billed
 token nobody counts** (9), **a request the provider is given nothing to
-answer** (10), **a spoken sentence the trace loses** (16), and **a turn the
+answer** (10), **a spoken sentence the trace loses** (16, 21), and **a turn the
 trace times wrong** (17–20). Read this before
 porting them to a new release — a clean `git rebase` says the text still
 applies, not that the reasoning does.
@@ -715,6 +716,75 @@ Do the generation writers still set `lk.interrupted=True` only when the handle
 is interrupted? Does a tool-running speech still sit in `_background_speeches`
 where a barge-in reaches it? If upstream records the interruption at span end
 itself, drop this.
+
+### 21. A realtime cut keeps fewer words than the caller heard
+
+*Files: `livekit-agents/.../voice/transcription/synchronizer.py`,
+`livekit-agents/.../voice/io.py`, `livekit-agents/.../voice/generation.py`,
+`livekit-agents/.../voice/agent_activity.py`, `livekit-agents/.../llm/realtime.py`,
+`livekit-agents/.../llm/realtime_fallback_adapter.py`, the `openai` plugin's
+`realtime_model.py` and `inference_realtime_model.py`, the `xai` plugin's
+`realtime_model.py`*
+
+An interrupted segment's text is the synchronizer's `synchronized_transcript`,
+which was the pacing loop's `forwarded_text`. That loop paces at a default 3.83
+hyphens/s (`STANDARD_SPEECH_RATE`) until both the text and the audio input have
+ended, re-estimates the speed only then, and counts a word once its whole paced
+delay has passed. Fully played gpt-realtime-1.5 turns measure mostly 4 to 5.7
+hyphens/s, and a long answer is still streaming when the caller cuts in. So a
+cut lost the words played since the pace fell behind, up to five on the calls
+of 2 October ("…mit" where the caller heard "…mit Temperaturen bis zu 26
+Grad."), and a cut inside the first word kept nothing ("Ich" needs 0.26 s at
+the default pace and got 0.25 s). The same text becomes the chat message and,
+on OpenAI, the `audio_transcript` of the `truncate`.
+
+A realtime model's transcript of its own speech arrives with the audio it
+transcribes: OpenAI sends an item's transcript and audio deltas as it generates
+them. The text and audio pushed so far then measure the speech rate even
+mid-stream. A transcript that leads its audio overstates what played by its lead
+× the playback position ÷ the pushed audio: little once the audio has run well
+ahead of the playout, but a three-word lead over 0.25 s of audio reads as 16
+hyphens/s. So the speed is capped at twice the default pace, above every rate
+measured on realtime voices. The new capability
+`RealtimeCapabilities.audio_transcript_in_step` says a model does this. The
+realtime path's native-audio branch passes it to `forward_generation`, which
+marks the segment through the new chained `AudioOutput.mark_transcript_in_step()`
+once it starts playing: by then the synchronizer holds that segment, however
+late its rotation ran. At a cut the synchronizer keeps the words whose speech
+starts before the playback position, at the pushed hyphens per second of pushed
+audio; a started word counts.
+
+Everything else keeps the paced text: the pipeline, the TTS fallback, `say()`
+and every model without the capability. An LLM's text runs whole sentences
+ahead of its TTS, so the text pushed there says nothing about what played. The
+capability is on for the `openai` plugin and for LiveKit Inference's `openai/`
+models, and off for `xai` and every other Inference provider, whose streams
+nobody has checked; Gemini, Nova Sonic, Ultravox, NVIDIA and Phonic leave it at
+its default `False` for the same reason (Phonic sends word timings anyway). The
+live transcript is untouched, so its last line can lag the stored text.
+
+Measuring from what has arrived needs no check on whether the inputs ended
+before the cut, so it is the same whichever comes first, the local cancel or a
+server cancel (`interrupt_response`) whose `response.done` closes the streams.
+The tests cut a reply of the 2 October shape, still streaming, both ways:
+"Klar, in" at 0.2 s and "…mit Temperaturen" at 2.8 s, where a model without the
+capability keeps "" and "…sonnig".
+
+Two things skew the measure. A sink that applies backpressure inflates it:
+`_SyncedAudioOutput.capture_frame` hands a frame to the sink before it pushes it
+to the synchronizer, so a sink that blocks holds the pushed audio back while the
+text keeps arriving. `DataStreamAudioOutput`, the avatar sink, awaits its stream
+writer this way; the cap bounds it. A provider transcript that stops early
+deflates it: gpt-realtime-1.5 once sent 28 characters for 32.5 s of audio
+(18 September 2026), and a cut there keeps a fraction of even those.
+
+*Porting checks:* does the `openai` plugin still push an item's transcript and
+audio deltas as they arrive? Is `_process_one_message`'s native-audio branch
+still where realtime audio is forwarded, reading the session's capabilities? Does
+`playback_started` still fire once a segment's first frame is in the
+synchronizer? Is `playback_position` still the played duration of the segment?
+Does `_SyncedAudioOutput.capture_frame` still pass a frame on before pushing it?
+If upstream derives a cut's text from the playback position itself, drop this.
 
 ## Verifying a port
 
