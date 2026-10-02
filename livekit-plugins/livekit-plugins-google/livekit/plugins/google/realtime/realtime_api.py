@@ -87,6 +87,16 @@ KNOWN_GEMINI_API_MODELS: frozenset[str] = frozenset(
 MODELS_WITHOUT_REPLY_PLACEHOLDER: tuple[str, ...] = ("3.1", "3.8")
 
 
+# Models whose `output_transcription` was measured to arrive with the audio it transcribes, a
+# part ahead of it, while the audio streams faster than real time. Extended Thinking streams
+# its audio at about real time with the text still a part ahead, which a cut would count as
+# heard; models nobody has measured keep the paced text.
+MODELS_WITH_TRANSCRIPT_IN_STEP: tuple[str, ...] = (
+    "gemini-3.8-live",
+    "gemini-2.5-flash-native-audio-preview-12-2025",
+)
+
+
 def _needs_reply_placeholder(model: str) -> bool:
     return not any(tag in model for tag in MODELS_WITHOUT_REPLY_PLACEHOLDER)
 
@@ -401,6 +411,7 @@ class RealtimeModel(llm.RealtimeModel):
                 mutable_instructions=True,
                 mutable_tools=False,
                 per_response_tool_choice=False,
+                audio_transcript_in_step=model in MODELS_WITH_TRANSCRIPT_IN_STEP,
             )
         )
 

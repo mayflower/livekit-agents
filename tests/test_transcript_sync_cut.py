@@ -16,9 +16,15 @@ import pytest
 
 from livekit import rtc
 from livekit.agents import Agent, AgentSession, tokenize, utils
-from livekit.agents.llm import FunctionCall, GenerationCreatedEvent, MessageGeneration
+from livekit.agents.llm import (
+    FunctionCall,
+    GenerationCreatedEvent,
+    MessageGeneration,
+    RealtimeCapabilities,
+)
 from livekit.agents.voice.io import PlaybackFinishedEvent
 from livekit.agents.voice.transcription.synchronizer import TranscriptSynchronizer
+from livekit.plugins import google
 
 from .fake_io import FakeAudioOutput
 from .fake_realtime import FakeRealtimeModel, fake_capabilities
@@ -64,7 +70,8 @@ class _Turn:
         self.audio.on("playback_finished", self.finished.append)
 
     async def push(self, text: str, audio: float) -> None:
-        await self.text.capture_text(text)
+        if text:
+            await self.text.capture_text(text)
         await self.audio.capture_frame(_frame(audio))
 
     async def stream(self, text: str, *, in_step: bool) -> None:
@@ -191,16 +198,39 @@ async def test_a_turn_played_to_its_end_keeps_its_whole_text(cut_at_the_end: boo
         await turn.sync.aclose()
 
 
-async def _realtime_cut(*, at: float, server_cancels_first: bool, in_step: bool = True) -> str:
-    """Cut a realtime reply ``at`` seconds into its playout while the model still streams it."""
-    model = FakeRealtimeModel(capabilities=fake_capabilities(audio_transcript_in_step=in_step))
+async def _realtime_cut(
+    *,
+    at: float,
+    server_cancels_first: bool = False,
+    in_step: bool = True,
+    capabilities: RealtimeCapabilities | None = None,
+    pushes: Callable[[Callable[[str, float], Awaitable[None]]], Awaitable[None]] | None = None,
+) -> str:
+    """Cut a realtime reply ``at`` seconds into its playout.
+
+    WEATHER is still streaming then. ``pushes`` pushes a reply of its own instead, and one
+    that has finished streaming by the cut has its streams closed, as the generation's end
+    closes them.
+    """
+    model = FakeRealtimeModel(
+        capabilities=capabilities or fake_capabilities(audio_transcript_in_step=in_step)
+    )
     sink = FakeAudioOutput()
     sync = TranscriptSynchronizer(next_in_chain_audio=sink, next_in_chain_text=None)
     text_ch, audio_ch = utils.aio.Chan[str](), utils.aio.Chan[rtc.AudioFrame]()
 
     async def push(word: str, seconds: float) -> None:
-        text_ch.send_nowait(word)
+        if word:
+            text_ch.send_nowait(word)
         audio_ch.send_nowait(_frame(seconds))
+
+    async def stream() -> None:
+        if pushes is None:
+            await _stream(WEATHER, rate=WEATHER_RATE, push=push)
+            return
+        await pushes(push)
+        text_ch.close()
+        audio_ch.close()
 
     async with AgentSession(llm=model) as session:
         session.output.audio = sync.audio_output
@@ -233,11 +263,11 @@ async def _realtime_cut(*, at: float, server_cancels_first: bool, in_step: bool 
             )
         )
 
-        streaming = asyncio.create_task(_stream(WEATHER, rate=WEATHER_RATE, push=push))
+        streaming = asyncio.create_task(stream())
         while sink._started_at is None:
             await asyncio.sleep(0)
         await asyncio.sleep(at)
-        assert not streaming.done(), "the reply finished streaming before the cut"
+        assert pushes is not None or not streaming.done(), "the reply finished streaming"
         streaming.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await streaming
@@ -288,3 +318,123 @@ async def test_a_realtime_model_without_an_in_step_transcript_keeps_the_paced_te
 
     assert WEATHER.startswith(transcript)
     assert len(transcript.split()) <= len(paced.split()), transcript
+
+
+# A reply as gemini-3.8-live streamed it: (seconds after its first audio, transcript, seconds
+# of audio). Each transcript part arrives a message ahead of its audio, the audio faster than
+# real time, so the whole reply is in long before it has played.
+GEMINI_REPLY = [
+    (0.0, "Ich konnte leider keinen ", 0.13),
+    (0.0238, "", 0.16),
+    (0.0835, "", 0.24),
+    (0.1383, "", 0.2),
+    (0.2308, "Kontakt mit dem Namen", 0.24),
+    (0.2322, "", 0.2),
+    (0.2799, "", 0.16),
+    (0.3146, "", 0.2),
+    (0.4703, " Mustermann finden.", 0.56),
+    (0.5412, "", 0.36),
+    (0.6285, "", 0.32),
+    (0.7201, "", 0.36),
+    (0.7672, "", 0.32),
+    (0.8518, "", 0.32),
+]
+GEMINI_COMPLETE = 0.8791
+GEMINI_TEXT = "".join(text for _, text, _ in GEMINI_REPLY)
+
+
+async def _gemini_stream(push: Callable[[str, float], Awaitable[None]]) -> None:
+    """Push GEMINI_REPLY at the times its parts arrived, up to its generation's end."""
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    for at, text, audio in GEMINI_REPLY:
+        await asyncio.sleep(t0 + at - loop.time())
+        await push(text, audio)
+    await asyncio.sleep(t0 + GEMINI_COMPLETE - loop.time())
+
+
+async def _gemini_turn(*, cut_at: float | None) -> str:
+    """GEMINI_REPLY through a synchronizer told it streams in step, cut or played out."""
+    turn = _Turn()
+    marked = False
+
+    async def push(text: str, audio: float) -> None:
+        nonlocal marked
+        await turn.push(text, audio=audio)
+        if not marked:
+            turn.audio.mark_transcript_in_step()
+            marked = True
+
+    async def stream() -> None:
+        await _gemini_stream(push)
+        turn.end_generation()
+
+    streaming = asyncio.create_task(stream())
+    try:
+        if cut_at is None:
+            await streaming
+            while not turn.finished:
+                await asyncio.sleep(0.05)
+        else:
+            await asyncio.sleep(cut_at)
+            if streaming.done():
+                turn.audio.clear_buffer()
+            else:
+                streaming.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await streaming
+                turn.cut_mid_generation()
+        return turn.transcript()
+    finally:
+        await turn.sync.aclose()
+
+
+@pytest.mark.parametrize(
+    ("cut_at", "heard"),
+    [
+        (0.2, "Ich"),  # inside the first word
+        (0.6, "Ich konnte"),  # still streaming
+        (1.5, "Ich konnte leider keinen Kont-"),  # streamed, still playing
+    ],
+    ids=["first_word", "mid_stream", "streamed"],
+)
+async def test_a_cut_in_a_gemini_reply_keeps_the_words_its_audio_played(
+    cut_at: float, heard: str
+) -> None:
+    # ``heard``: the reply's audio up to the cut, transcribed
+    transcript = await _gemini_turn(cut_at=cut_at)
+
+    assert transcript.split()[:1] == ["Ich"], transcript
+    assert GEMINI_TEXT.startswith(transcript)
+    assert abs(len(transcript.split()) - len(heard.split())) <= 1, transcript
+
+
+async def test_a_gemini_reply_played_to_its_end_keeps_its_whole_text() -> None:
+    assert await _gemini_turn(cut_at=None) == GEMINI_TEXT
+
+
+@pytest.mark.parametrize(
+    ("model", "in_step"),
+    [
+        ("gemini-3.8-live", True),
+        ("gemini-2.5-flash-native-audio-preview-12-2025", True),
+        # streams its audio at about real time, its text a part ahead
+        ("gemini-3.8-live-extended-thinking", False),
+        ("gemini-3.1-flash-live-preview", False),
+    ],
+)
+async def test_a_cut_in_a_gemini_session_measures_what_played_where_its_stream_was_measured(
+    monkeypatch: pytest.MonkeyPatch, model: str, in_step: bool
+) -> None:
+    """A model whose streams nobody measured keeps the paced text, short as it is."""
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    capabilities = google.realtime.RealtimeModel(model=model).capabilities
+    heard = len("Ich konnte leider keinen Kont-".split())
+
+    transcript = await _realtime_cut(at=1.5, capabilities=capabilities, pushes=_gemini_stream)
+
+    assert GEMINI_TEXT.startswith(transcript)
+    if in_step:
+        assert abs(len(transcript.split()) - heard) <= 1, transcript
+    else:
+        assert len(transcript.split()) <= heard - 2, transcript
