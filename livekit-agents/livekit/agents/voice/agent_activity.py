@@ -2402,7 +2402,9 @@ class AgentActivity(RecognitionHooks):
         routine session rotation alike — and emits ``session_reconnected``
         without a synthetic ``input_speech_stopped``. That is the known way for
         a start to go unpaired, and it is cheaper to answer than to wait out
-        :data:`_UNPAIRED_SPEECH_TIMEOUT`. Registered once per session, weakly.
+        :data:`_UNPAIRED_SPEECH_TIMEOUT`. A session that still ends the turn itself
+        says so with ``speech_stop_follows``, and the turn stays open until it does.
+        Registered once per session, weakly.
         """
         rt_session = self._rt_session
         if rt_session is None or getattr(rt_session, _RECONNECT_ARMED_ATTR, False):
@@ -2410,9 +2412,11 @@ class AgentActivity(RecognitionHooks):
 
         ref = weakref.ref(self)
 
-        def _on_session_reconnected(_ev: Any = None) -> None:
+        def _on_session_reconnected(ev: Any = None) -> None:
             activity = ref()
-            if activity is not None:
+            # a session that still ends the turn itself would have it released early, and a
+            # queued reply would play over a user still talking
+            if activity is not None and not getattr(ev, "speech_stop_follows", False):
                 activity._release_unpaired_user_speech()
 
         rt_session.on("session_reconnected", _on_session_reconnected)

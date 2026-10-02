@@ -219,6 +219,10 @@ class RealtimeSessionReconnectedEvent:
     """Whether the provider resumed the previous session, keeping the conversation on its
     side, rather than opening one the session replays the conversation into; None unless
     the provider says so"""
+    speech_stop_follows: bool = False
+    """Whether the session still sends the ``input_speech_stopped`` for user speech it
+    reported as started before the reconnect. When it does not, the old connection took that
+    stop with it, and the framework ends the user turn itself."""
 
 
 @dataclass

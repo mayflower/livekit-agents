@@ -237,6 +237,30 @@ async def test_an_unpaired_speech_start_releases_itself() -> None:
     assert activity._session.user_state == "listening"
 
 
+@pytest.mark.parametrize(("stop_follows", "released"), [(False, True), (True, False)])
+async def test_a_reconnect_ends_the_user_turn_only_when_its_stop_is_lost(
+    stop_follows: bool, released: bool
+) -> None:
+    """A provider that still ends the turn itself must keep it open across the reconnect.
+
+    Released early, the latch lets a queued reply play over a caller who is still talking.
+    """
+    from livekit.agents.llm import InputSpeechStartedEvent, RealtimeSessionReconnectedEvent
+
+    activity = _speech_signal_activity()
+    activity.interrupt = lambda source=None, **_: None
+    rt_session = FakeRealtimeModel().session()
+    activity._rt_session = rt_session
+    activity._on_input_speech_started(InputSpeechStartedEvent())
+
+    rt_session.emit(
+        "session_reconnected", RealtimeSessionReconnectedEvent(speech_stop_follows=stop_follows)
+    )
+
+    assert activity._user_silence_event.is_set() is released
+    assert activity._session.user_state == ("listening" if released else "speaking")
+
+
 async def test_a_client_vad_keeps_ownership_of_the_signals() -> None:
     """When a real VAD is driving, its stream is authoritative and this stays out."""
     from livekit.agents.llm import InputSpeechStartedEvent
