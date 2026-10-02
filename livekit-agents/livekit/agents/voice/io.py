@@ -321,6 +321,16 @@ class AudioOutput(
         if self.next_in_chain:
             self.next_in_chain.pause()
 
+    def mark_transcript_in_step(self) -> None:
+        """Mark the transcript of the segment being played as streaming in step with its audio.
+
+        A realtime model's transcript of its own speech does; an LLM's text runs ahead of the
+        TTS audio made from it. A transcript synchronizer then measures where a cut lands from
+        the text and audio that have arrived, even while the segment is still streaming.
+        """
+        if self.next_in_chain:
+            self.next_in_chain.mark_transcript_in_step()
+
     def resume(self) -> None:
         """Resume the audio playback"""
         if self.next_in_chain:

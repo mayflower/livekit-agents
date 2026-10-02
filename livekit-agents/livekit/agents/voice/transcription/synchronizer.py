@@ -160,6 +160,10 @@ class _SegmentSynchronizerImpl:
         self._speed_on_speaking_unit: float | None = None  # hyphens per speaking unit
         # a speaking unit is defined by the speaking rate estimation method, it's a relative unit
 
+        # whether the text arrives with the audio it transcribes (see mark_transcript_in_step)
+        self._transcript_in_step = False
+        self._cut_transcript: str | None = None
+
         self._out_ch = utils.aio.Chan[TimedString]()
         self._close_future = asyncio.Future[None]()
 
@@ -296,6 +300,16 @@ class _SegmentSynchronizerImpl:
             self._paused_wall_time = None
         self._output_enabled_ev.set()
 
+    def mark_transcript_in_step(self) -> None:
+        if self.closed:
+            logger.warning(
+                "_SegmentSynchronizerImpl.mark_transcript_in_step called after close",
+                extra={"impl_id": self._id},
+            )
+            return
+
+        self._transcript_in_step = True
+
     def _reestimate_speed(self) -> None:
         if not self._text_data.done or not self._audio_data.done:
             return
@@ -329,6 +343,11 @@ class _SegmentSynchronizerImpl:
             return
 
         self._interrupted = interrupted
+        if interrupted and self._transcript_in_step:
+            # the paced text lags the audio: it runs at a default speed until both inputs end
+            # and counts a word only once its whole delay has passed
+            self._cut_transcript = self._text_started_by(playback_position)
+
         if not self._text_data.done or not self._audio_data.done:
             logger.warning(
                 "_SegmentSynchronizerImpl.playback_finished called before text/audio input is done",
@@ -350,7 +369,35 @@ class _SegmentSynchronizerImpl:
         if self._playback_completed:
             return self._text_data.pushed_text
 
+        if self._cut_transcript is not None:
+            return self._cut_transcript
+
         return self._text_data.forwarded_text
+
+    def _text_started_by(self, playback_position: float) -> str:
+        """The pushed words whose speech starts before ``playback_position``, at the speech
+        rate of the text and audio pushed so far."""
+        if playback_position <= 0 or self._audio_data.pushed_duration <= 0:
+            return ""
+
+        stripper = TranscriptMarkupStripper()
+        words = self._opts.word_tokenizer.tokenize(self._text_data.pushed_text)
+        hyphens = [self._word_hyphens(stripper.push(word)) for word in words]
+        # a transcript that runs ahead of the little audio pushed early on reads as speech no
+        # one speaks; twice the default pace is above every rate measured on realtime voices
+        speed = min(
+            sum(hyphens) / self._audio_data.pushed_duration,
+            2 * STANDARD_SPEECH_RATE * self._opts.speed,
+        )
+        played = playback_position * speed
+
+        text, spoken = "", 0
+        for word, word_hyphens in zip(words, hyphens, strict=True):
+            if spoken and spoken >= played:  # the first word has started once anything played
+                break
+            text += word
+            spoken += word_hyphens
+        return text
 
     @utils.log_exceptions(logger=logger)
     async def _capture_task(self) -> None:
@@ -399,8 +446,7 @@ class _SegmentSynchronizerImpl:
             # expression downstream), but pace against the visible text only so markup
             # adds no delay. The stripper holds back an unclosed tag across tokens and
             # releases the clean text once it completes.
-            clean_word = self._pacing_stripper.push(word)
-            word_hyphens = len(self._calc_hyphens(clean_word)) if clean_word.strip() else 0
+            word_hyphens = self._word_hyphens(self._pacing_stripper.push(word))
             elapsed = time.time() - self._start_wall_time - self._paused_duration
 
             d_hyphens = 0
@@ -437,6 +483,9 @@ class _SegmentSynchronizerImpl:
 
             self._text_data.forwarded_hyphens += word_hyphens
             self._text_data.forwarded_text += word
+
+    def _word_hyphens(self, clean_word: str) -> int:
+        return len(self._calc_hyphens(clean_word)) if clean_word.strip() else 0
 
     def _calc_hyphens(self, text: str) -> list[str]:
         """Calculate hyphens for text."""
@@ -726,6 +775,11 @@ class _SyncedAudioOutput(io.AudioOutput):
     def on_detached(self) -> None:
         super().on_detached()
         self._synchronizer._on_attachment_changed(audio_attached=False)
+
+    def mark_transcript_in_step(self) -> None:
+        super().mark_transcript_in_step()
+        if self._synchronizer.enabled:
+            self._synchronizer._impl.mark_transcript_in_step()
 
     def pause(self) -> None:
         super().pause()
