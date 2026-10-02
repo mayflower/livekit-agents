@@ -66,16 +66,16 @@ repository settings.
 
 ## What is patched
 
-Twenty-seven commits in twenty-one entries against nine defect classes: **a finished
-tool result never reaching the caller** (1–4), **a Gemini session dropped for no
-reason** (5–6, 12), **a finished reply the session will not let out** (7, 13),
-**a caller transcript that is not the one the session asked for** (8, 11, 14),
-**a prompt change the model never takes as its instruction** (15), **a billed
-token nobody counts** (9), **a request the provider is given nothing to
-answer** (10), **a spoken sentence the trace loses** (16, 21), and **a turn the
-trace times wrong** (17–20). Read this before
-porting them to a new release — a clean `git rebase` says the text still
-applies, not that the reasoning does.
+Thirty-three commits in twenty-four entries against ten defect classes: **a
+finished tool result never reaching the caller** (1–4), **a Gemini session dropped
+for no reason** (5–6, 12), **a finished reply the session will not let out** (7,
+13), **a caller transcript that is not the one the session asked for** (8, 11,
+14), **a prompt change the model never takes as its instruction** (15), **a billed
+token nobody counts** (9), **a request the provider is given nothing to answer**
+(10), **a spoken sentence the trace loses** (16, 21, 24), **a turn the trace times
+wrong** (17–20, 22), and **a reconnect nobody hears of** (23). Read this before
+porting them to a new release — a clean `git rebase` says the text still applies,
+not that the reasoning does.
 
 ### 1. Concurrent chat-context writers lose each other's items
 
@@ -759,8 +759,9 @@ and every model without the capability. An LLM's text runs whole sentences
 ahead of its TTS, so the text pushed there says nothing about what played. The
 capability is on for the `openai` plugin and for LiveKit Inference's `openai/`
 models, and off for `xai` and every other Inference provider, whose streams
-nobody has checked; Gemini, Nova Sonic, Ultravox, NVIDIA and Phonic leave it at
-its default `False` for the same reason (Phonic sends word timings anyway). The
+nobody has checked; Nova Sonic, Ultravox, NVIDIA and Phonic leave it at its
+default `False` for the same reason (Phonic sends word timings anyway). Gemini
+had it off too, until entry 24 measured its streams. The
 live transcript is untouched, so its last line can lag the stored text.
 
 Measuring from what has arrived needs no check on whether the inputs ended
@@ -785,6 +786,170 @@ still where realtime audio is forwarded, reading the session's capabilities? Doe
 synchronizer? Is `playback_position` still the played duration of the segment?
 Does `_SyncedAudioOutput.capture_frame` still pass a frame on before pushing it?
 If upstream derives a cut's text from the playback position itself, drop this.
+
+### 22. A realtime reply does not say when the provider ended the turn it answers
+
+*Files: `livekit-agents/.../llm/realtime.py`,
+`livekit-agents/.../telemetry/trace_types.py`,
+`livekit-agents/.../voice/agent_activity.py`,
+`livekit-plugins-google/.../realtime/realtime_api.py`*
+
+Gemini 3.8 Live sends `voice_activity` unasked, on the Gemini API and with no
+config. Probed on 2026-10-02 against `gemini-3.8-live`, five caller turns cut from
+a call recording and streamed in real time: `ACTIVITY_START` with an
+`audio_offset` 0.10–0.20 s into the speech, `ACTIVITY_END` with one 1.03–1.20 s
+after the last word — its silence window, so the end-of-turn decision, not the
+last word. The end arrived 0.03–0.08 s after its offset (once 0.46 s), right after
+the committed `input_transcription`, and the reply's first audio followed
+0.07–0.12 s later (a tool call 0–0.49 s). During playout the start came in the
+same message as `server_content.interrupted`. `gemini-3.8-live-extended-thinking`
+sends it too; `gemini-2.5-flash-native-audio-preview-12-2025` sent none in three
+sessions. `voice_activity_detection_signal`, which the SDK marks "Allowlisted
+only", never came, and `explicit_vad_signal` is Vertex-only in the SDK.
+
+The plugin read none of it. It emits `input_speech_started` only on `interrupted`
+and `input_speech_stopped` when the generation is done, so the session has a
+`user_speaking` span only at a barge-in, about 10 ms long: three in a 106 s call
+on 2 October, with 16 caller utterances outside every span. A trace could not tell
+how much of the wait before a reply was the provider's turn detection.
+
+`GenerationCreatedEvent.input_speech_stopped_at` now carries when the provider's
+turn detection ended the speech a generation answers (`time.time()`). The end
+often arrives just after the caller's transcript opened the generation, so the
+provider may fill it in on the event it already emitted, until the generation
+ends. `AgentActivity` writes it as `lk.input_speech_stopped_at` on
+`realtime_inference` when the inference ends, with or without a usage report.
+
+The plugin stamps the generation the caller's transcript opened, while it has said
+nothing, and otherwise the next generation the service starts. It never stamps a
+requested reply, which answers the request. An end no generation took is dropped
+by the next `ACTIVITY_START`, by anything the session sends the model to answer (a
+tool result, client content that completes a turn — `generate_reply` sends one)
+and by a reconnect, so a later reply cannot inherit it. On a tool turn the end
+stays on the generation that called the tool: it answered the caller, and the
+reply after the tool result answers the result. The caller's wait is the end to
+the first agent audio after it, tool time included — in the probe the end at
+9.06 s, the tool call in the same burst, the first audio at 10.33 s.
+
+The time is the end's arrival, not its `audio_offset`. The SDK documents the
+offset as counted from the start of the audio stream, and reading it as wall time
+would take a stream sent in real time without a gap: the plugin queues audio while
+it reconnects and sends the backlog to the new connection, whose stream starts
+anew. The same lack of a robust mapping is why OpenAI's `audio_start_ms` is not
+used either. The arrival can be late by what the probe saw, 0.46 s once.
+
+It is recorded and nothing else. Emitting the speech events instead would change
+the turn taking: `input_speech_started` stops the agent's playout, and the pair
+latches `_user_silence_event` (entry 3), which holds back a queued reply for as
+long as it lasts. Gemini decides a barge-in itself and says so with `interrupted`;
+a test pins that voice activity emits no speech event and opens no generation.
+
+*Porting checks:* does the plugin still emit no speech event on `voice_activity`?
+Does the end still arrive before the reply's first output? Does `AgentActivity`
+still end `realtime_inference` after the generation's streams closed? If upstream
+maps `voice_activity` onto `input_speech_started`/`stopped`, the `user_speaking`
+span carries the decision and this can go.
+
+### 23. A Gemini reconnect leaves no trace
+
+*Files: `livekit-agents/.../llm/realtime.py`,
+`livekit-agents/.../telemetry/trace_types.py`,
+`livekit-agents/.../voice/agent_activity.py`,
+`livekit-plugins-google/.../realtime/realtime_api.py`*
+
+The Google plugin replaces its connection on `go_away`, on a send or receive error
+and on an option or tool change (`_mark_restart_needed`), resuming through the
+last `session_resumption` handle, and fresh from `reconnect()` (entry 15). It
+never emitted `session_reconnected`, which the OpenAI, gpt-live and NVIDIA plugins
+and the fallback adapter emit. The framework records a reconnect for no provider:
+each connect's zero-usage `RealtimeModelMetrics` (`_report_connection_acquired`)
+has an empty `request_id` and lands on no span. So a call's trace could not show
+where the model's memory may have started over — a resumed connection keeps the
+conversation, a fresh one gets it replayed without its tool calls.
+
+`AgentActivity` now marks every `session_reconnected` on the `agent_session` span
+as a `realtime_session_reconnected` event, through `_add_session_event` as the
+state changes are, for every provider and a fallback adapter's swap.
+`RealtimeSessionReconnectedEvent` gains `resumed`, `None` unless the provider says
+so, and the event carries it as `lk.session_resumed`. The plugin emits
+`session_reconnected` after every connect but the first, once the replay or the
+sync is sent. Probed on 2026-10-02, a connection opened with a real handle had the
+conversation back (the model recalled a word told on the first connection), while
+a made-up handle failed the connect with 1008 "Requested entity was not found".
+`setup_complete` carries no session id on the Gemini API. So a connection that
+opened with a handle has resumed, and that is what `resumed` reports.
+
+Emitting the event reaches entry 3's backstop, which ends a latched user turn on
+reconnect, and that would have changed the turn taking. A barge-in that arrives as
+`interrupted` with no generation open — the reply done, its audio still playing —
+starts a turn that only the next generation's end closes, on whichever connection.
+Released at the reconnect, it would let a queued reply play over a caller still
+talking. `RealtimeSessionReconnectedEvent` gains `speech_stop_follows`, the
+backstop leaves the turn open when it is set, and the plugin sets it: the stop
+still comes. A reconnect with a generation open is unaffected, since `_recv_task`
+ends that generation, stop included, before the new connection opens. Fake-socket
+tests run a turn before and after a reconnect, resumed and fresh, between turns
+and mid-reply, and find no generation, speech event or chat item lost or doubled.
+
+Not probed live: a `go_away` cannot be provoked. Not covered: a handle the service
+has expired would fail every retry the same way, and the session would give up.
+
+*Porting checks:* does the plugin still resume through a handle and replay without
+one, and does the service still refuse a handle it cannot resume? Does
+`_recv_task` still end an open generation as the connection closes? If upstream
+emits `session_reconnected` from the Google plugin or traces reconnects itself,
+drop the matching half.
+
+### 24. A Gemini cut keeps fewer words than the caller heard
+
+*Files: `livekit-plugins-google/.../realtime/realtime_api.py`*
+
+Entry 21 left Gemini without `audio_transcript_in_step` because nobody had checked
+its streams. On the `gemini-3.8-live` call of 2 October two of the three cuts kept
+one and two words fewer than the agent's audio held up to the cut, transcribed.
+
+Probed the same day: `gemini-3.8-live` sends each `output_transcription` part a
+message ahead of the audio it transcribes, with the audio at four to five times
+real time and `generation_complete` 0.9–1.5 s after the first audio of a 3.8–6.5 s
+reply. `gemini-2.5-flash-native-audio-preview-12-2025` sends its first parts up to
+1.1 s before the first audio, then the same way at about four times real time.
+`gemini-3.8-live-extended-thinking` streams its audio at about real time, 8.8 s of
+it over 8.7 s, with the text a part, about a second of speech, ahead throughout.
+So on the first two a cut usually lands after both inputs have ended, and the
+paced text is still short: the pacing loop re-estimates the speed only then, and
+counts a word once its whole delay has passed.
+
+Replayed through the synchronizer under virtual time, each cut against the reply's
+audio transcribed up to it (transcripts that heard other words than the reply
+dropped): how many cuts came within one word of it, and the mean difference in
+words.
+
+```
+                            paced           in step
+model                cuts   within 1  mean  within 1  mean
+gemini-3.8-live        33         22  -1.2        29  +0.2
+2.5 native audio       29         17  -1.5        25  -0.4
+3.8 extended thinking  22         12  -1.4         9  +1.5
+```
+
+The capability is on for `gemini-3.8-live` and
+`gemini-2.5-flash-native-audio-preview-12-2025`
+(`MODELS_WITH_TRANSCRIPT_IN_STEP`). Extended Thinking stays off, since its text's
+lead never shrinks against the audio, and so do `gemini-3.1-flash-live-preview`
+and Vertex's `gemini-live-2.5-flash-native-audio`, which nobody has measured.
+
+The four misses on `gemini-3.8-live` are the method's limits. +2 at a cut 1 s into
+a reply still streaming: the transcript's lead counts as played until the audio
+has run well ahead, and only a provider-specific lead could correct that. +3 where
+"GmbH" counts as one hyphen for four spoken syllables. −2 twice, after the stream
+had ended: one speech rate for the whole reply, while the reply does not keep one
+— a long name, a pause between sentences. The transcription the cuts are judged
+against is itself a clip cut mid-word, good to about one word.
+
+*Porting checks:* does `output_transcription` still arrive interleaved with the
+audio, and does the audio still outrun real time on the models listed? A
+transcript that kept its lead, as Extended Thinking's does, would make the measure
+overcount. Do the other porting checks of entry 21 still hold?
 
 ## Verifying a port
 
