@@ -231,6 +231,8 @@ class _ResponseGeneration:
     interim_input_transcription: str = ""
     """The last speculative caller transcript, superseded by the committed one."""
     output_text: str = ""
+    generation_event: llm.GenerationCreatedEvent | None = None
+    """How the generation was announced; it carries the end of speech the generation answers"""
 
     _created_timestamp: float = field(default_factory=time.time)
     """The timestamp when the generation is created"""
@@ -242,6 +244,24 @@ class _ResponseGeneration:
     """Whether the generation is done (set when the turn is complete)"""
     _extra_content_warned: bool = False
     """Whether we've warned about audio/text arriving after generation completed"""
+
+    @property
+    def has_output(self) -> bool:
+        """Whether the model has said anything in this generation yet"""
+        return self._first_token_timestamp is not None or bool(self.output_text)
+
+    def answers_end_of_speech(self) -> bool:
+        """Whether an end of the caller's speech reported now is this generation's to answer.
+
+        Only while it has said nothing, and only if the service started it: a requested
+        reply answers the request.
+        """
+        return (
+            not self._done
+            and not self.has_output
+            and self.generation_event is not None
+            and not self.generation_event.user_initiated
+        )
 
     def push_text(self, text: str) -> None:
         if self.text_ch.closed:
@@ -570,6 +590,8 @@ class RealtimeSession(llm.RealtimeSession):
         self._rejected_tool_calls = 0
         # whether the service said its last `turn_complete` did not end the turn
         self._interaction_in_progress = False
+        # an end of the caller's speech that no generation has answered yet
+        self._input_speech_stopped_at: float | None = None
 
         self._session_resumption_handle: str | None = (
             self._opts.session_resumption.handle
@@ -929,6 +951,11 @@ class RealtimeSession(llm.RealtimeSession):
         self._send_client_event(realtime_input)
 
     def _send_client_event(self, event: ClientEvents) -> None:
+        if isinstance(event, types.LiveClientToolResponse) or (
+            isinstance(event, types.LiveClientContent) and event.turn_complete is not False
+        ):
+            # the model answers this next, not the caller's last turn
+            self._input_speech_stopped_at = None
         with contextlib.suppress(utils.aio.channel.ChanClosed):
             self._msg_ch.send_nowait(event)
 
@@ -1094,6 +1121,8 @@ class RealtimeSession(llm.RealtimeSession):
                 ) as session:
                     self._report_connection_acquired(time.perf_counter() - t0)
                     self._connected_once = True
+                    # the speech the old connection ended is not what this one answers
+                    self._input_speech_stopped_at = None
                     async with self._session_lock:
                         self._active_session = session
 
@@ -1328,6 +1357,10 @@ class RealtimeSession(llm.RealtimeSession):
                         self._reject_tool_calls(response.tool_call.function_calls or [])
                         continue
 
+                    if response.voice_activity:
+                        # ahead of the generation it may open, which then answers it
+                        self._handle_voice_activity(response.voice_activity)
+
                     if not self._current_generation or self._current_generation._done:
                         if (sc := response.server_content) and sc.interrupted:
                             # two cases an interrupted event is sent without an active generation
@@ -1504,6 +1537,7 @@ class RealtimeSession(llm.RealtimeSession):
             response_id=self._current_generation.response_id,
         )
 
+        self._current_generation.generation_event = generation_event
         if self._pending_generation_fut and not self._pending_generation_fut.done():
             generation_event.user_initiated = True
             self._pending_generation_fut.set_result(generation_event)
@@ -1518,6 +1552,9 @@ class RealtimeSession(llm.RealtimeSession):
             # stopping playout for it cuts the model off mid-sentence.
             self._handle_input_speech_started(speech_detected=False)
 
+        if not generation_event.user_initiated:
+            generation_event.input_speech_stopped_at = self._input_speech_stopped_at
+        self._input_speech_stopped_at = None
         self.emit("generation_created", generation_event)
 
     def _emit_input_transcription(
@@ -1725,6 +1762,32 @@ class RealtimeSession(llm.RealtimeSession):
             "input_speech_started",
             llm.InputSpeechStartedEvent(speech_detected=speech_detected),
         )
+
+    def _handle_voice_activity(self, activity: types.VoiceActivity) -> None:
+        """Note when the service ends the caller's turn, for the generation that answers it.
+
+        Gemini 3.8 Live sends `voice_activity` unasked: ACTIVITY_START once the caller has
+        started speaking, ACTIVITY_END once its silence window after the last word has
+        passed, which is the end-of-turn decision.
+
+        The time is when the end arrives, not its `audio_offset`: that counts from the start
+        of this connection's audio stream, and reading it as wall time would take an
+        unbroken stream sent in real time, which a reconnect's backlog breaks.
+
+        Recorded only. Turn taking stays on `server_content.interrupted` and the generation
+        lifecycle: `input_speech_started` stops the agent's playout and the pair holds back
+        queued replies while it lasts, so emitting them here as well would change both.
+        """
+        if activity.voice_activity_type == types.VoiceActivityType.ACTIVITY_START:
+            # a new utterance; an end the service left unanswered is not this one's
+            self._input_speech_stopped_at = None
+        elif activity.voice_activity_type == types.VoiceActivityType.ACTIVITY_END:
+            gen = self._current_generation
+            if gen is not None and gen.generation_event and gen.answers_end_of_speech():
+                # opened by the caller's transcript, which arrives just ahead of the end
+                gen.generation_event.input_speech_stopped_at = time.time()
+            else:
+                self._input_speech_stopped_at = time.time()
 
     def _handle_input_speech_stopped(self) -> None:
         self.emit(
