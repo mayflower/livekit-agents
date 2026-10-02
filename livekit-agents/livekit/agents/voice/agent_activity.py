@@ -4439,6 +4439,11 @@ class AgentActivity(RecognitionHooks):
                     inference_span=inference_span,
                 )
             finally:
+                # read last: the provider may fill it in after the generation opened
+                if (stopped_at := generation_ev.input_speech_stopped_at) is not None:
+                    inference_span.set_attribute(
+                        trace_types.ATTR_INPUT_SPEECH_STOPPED_AT, stopped_at
+                    )
                 inference_span.end()
 
     async def _realtime_generation_task_impl(

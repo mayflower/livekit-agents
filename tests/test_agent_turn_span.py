@@ -269,6 +269,31 @@ async def test_realtime_playout_position_counts_every_generation(
     assert attrs[trace_types.ATTR_PLAYOUT_POSITION] == pytest.approx(0.8, abs=0.05)
 
 
+@pytest.mark.parametrize("stopped_at", [1790966541.96, None])
+async def test_a_realtime_inference_says_when_the_provider_ended_the_speech_it_answers(
+    span_exporter: InMemorySpanExporter, stopped_at: float | None
+) -> None:
+    """Written when the inference ends, so it needs no usage report and may come late.
+
+    A provider can learn the end of the user's speech just after the event that opened
+    the generation, so it fills the field in on the event it already emitted.
+    """
+    model = FakeRealtimeModel()
+
+    async with AgentSession(llm=model) as session:
+        session.output.audio = FakeAudioOutput()
+        await session.start(Agent(instructions="You are a helpful assistant."))
+
+        reply = session.generate_reply()
+        generation = _generation(response_id="first", text="Hello.", audio_duration=0.2)
+        (await _next_reply(model)).set_result(generation)
+        generation.input_speech_stopped_at = stopped_at
+        await asyncio.wait_for(reply, timeout=10)
+
+    [inference] = _spans(span_exporter, "realtime_inference")
+    assert (inference.attributes or {}).get(trace_types.ATTR_INPUT_SPEECH_STOPPED_AT) == stopped_at
+
+
 async def test_plain_reply_is_one_generation(span_exporter: InMemorySpanExporter) -> None:
     actions = FakeActions()
     actions.add_user_speech(0.5, 1.5, "Hello", stt_delay=0.1)
