@@ -7,6 +7,7 @@ from pydantic import AfterValidator, BaseModel, BeforeValidator, Field, Positive
 
 from livekit.agents import Agent
 from livekit.agents.llm import (
+    FunctionCall,
     ProviderTool,
     Tool,
     ToolContext,
@@ -686,6 +687,42 @@ class TestToolExecution:
         # which raises a more specific error.
         with pytest.raises(ValueError, match="non-JSON string"):
             parse_function_arguments('"just a string"')
+
+    @pytest.mark.parametrize("raw", ["[]", "[ ]", "", "  "])
+    def test_parameterless_tool_accepts_an_empty_payload(self, raw):
+        """gpt-realtime-1.5 sometimes calls a tool that takes no arguments with
+        ``[]`` or nothing at all instead of ``{}``. Rejecting that left a
+        hang-up tool unexecuted and the phone call open; with nothing to fill
+        in, an empty payload can only mean "no arguments"."""
+
+        @function_tool
+        async def hang_up() -> str:
+            """End the call"""
+            return "bye"
+
+        call = FunctionCall(call_id="call-empty", name="hang_up", arguments=raw)
+        assert prepare_function_arguments(fnc=hang_up, json_arguments=raw, fnc_call=call) == (
+            (),
+            {},
+        )
+        assert call.arguments == "{}"
+
+    def test_empty_payload_still_rejected_where_it_means_something(self):
+        """The leniency stops at empty payloads for tools with nothing to fill
+        in: a tool that needs an argument still gets the error to self-correct
+        on, and a non-empty list stays a malformed call."""
+
+        @function_tool
+        async def hang_up() -> str:
+            """End the call"""
+            return "bye"
+
+        with pytest.raises(ToolError, match="expected dict"):
+            prepare_function_arguments(fnc=mock_tool_1, json_arguments="[]")
+        with pytest.raises(ToolError, match="could not parse"):
+            prepare_function_arguments(fnc=mock_tool_1, json_arguments="")
+        with pytest.raises(ToolError, match="expected dict"):
+            prepare_function_arguments(fnc=hang_up, json_arguments="[1]")
 
     def test_prepare_function_arguments_accepts_pre_parsed_dict(self):
         """Callers that already parsed the JSON (e.g. _execute_tools_task after
