@@ -66,14 +66,15 @@ repository settings.
 
 ## What is patched
 
-Thirty-three commits in twenty-four entries against ten defect classes: **a
+Thirty-four commits in twenty-five entries against eleven defect classes: **a
 finished tool result never reaching the caller** (1–4), **a Gemini session dropped
 for no reason** (5–6, 12), **a finished reply the session will not let out** (7,
 13), **a caller transcript that is not the one the session asked for** (8, 11,
 14), **a prompt change the model never takes as its instruction** (15), **a billed
 token nobody counts** (9), **a request the provider is given nothing to answer**
 (10), **a spoken sentence the trace loses** (16, 21, 24), **a turn the trace times
-wrong** (17–20, 22), and **a reconnect nobody hears of** (23). Read this before
+wrong** (17–20, 22), **a reconnect nobody hears of** (23), and **a tool call
+refused for a payload that carries nothing** (25). Read this before
 porting them to a new release — a clean `git rebase` says the text still applies,
 not that the reasoning does.
 
@@ -950,6 +951,33 @@ against is itself a clip cut mid-word, good to about one word.
 audio, and does the audio still outrun real time on the models listed? A
 transcript that kept its lead, as Extended Thinking's does, would make the measure
 overcount. Do the other porting checks of entry 21 still hold?
+
+### 25. A tool without parameters is refused for an empty payload
+
+*Files: `llm/utils.py`*
+
+`prepare_function_arguments` raises a `ToolError` whenever
+`parse_function_arguments` does not return a dict, and the tool never runs.
+`gpt-realtime-1.5` sometimes calls a tool that takes no arguments with `[]` or
+with nothing at all instead of `{}`: about one goodbye in six in
+voice-demo-solution's evals (VDS-523), where the tool was `end_phone_call` and
+the caller stayed on the line. Probed against fix19: `{}`, `{"": ""}`, `null`
+and `{"foo": 1}` bind; `[]`, `[{}]` and `""` are refused.
+
+The fix catches the parse error in `prepare_function_arguments`, not in
+`parse_function_arguments`: only the caller knows the tool, and a tool that has
+parameters needs the error to self-correct on. With nothing to fill in, a blank
+payload or an empty list can only mean "no arguments", so it binds as `{}`, and
+the canonical write-back that already follows puts `{}` in the chat history.
+`parse_function_arguments` keeps rejecting every non-dict, as upstream's
+`test_parse_function_arguments_non_dict_raises` requires. Left refused on
+purpose: a non-empty list, `[{}]` included, and any empty payload for a raw
+function tool, whose schema is its own.
+
+*Porting check:* does `prepare_function_arguments` still turn every
+`parse_function_arguments` failure into a `ToolError`? Still so in
+`livekit-agents@1.8.6`. If upstream starts accepting an empty payload for a
+parameterless tool, drop this.
 
 ## Verifying a port
 
