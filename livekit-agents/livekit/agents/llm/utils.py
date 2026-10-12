@@ -612,6 +612,25 @@ def parse_function_arguments(json_arguments: str) -> dict[str, Any]:
     return args_dict
 
 
+def _is_empty_payload(json_arguments: str) -> bool:
+    """Whether raw tool-call arguments carry nothing: blank, or an empty list."""
+    stripped = json_arguments.strip()
+    if not stripped:
+        return True
+    try:
+        return bool(from_json(stripped) == [])
+    except ValueError:
+        return False
+
+
+def _takes_no_arguments(fnc: FunctionTool | RawFunctionTool) -> bool:
+    """Whether the model has nothing to fill in for this tool. A raw tool's
+    schema is its own, so it never counts."""
+    return (
+        isinstance(fnc, FunctionTool) and not function_arguments_to_pydantic_model(fnc).model_fields
+    )
+
+
 def prepare_function_arguments(
     *,
     fnc: FunctionTool | RawFunctionTool,
@@ -638,11 +657,16 @@ def prepare_function_arguments(
         try:
             args_dict = parse_function_arguments(json_arguments)
         except ValueError as e:
-            logger.error(
-                f"error parsing arguments for `{fnc.info.name}`",
-                extra={"function": fnc.info.name, "lk.pii.arguments": json_arguments},
-            )
-            raise ToolError(f"Error parsing arguments for `{fnc.info.name}`: {e}") from e
+            if _is_empty_payload(json_arguments) and _takes_no_arguments(fnc):
+                # gpt-realtime-1.5 sometimes sends `[]` or nothing for a tool
+                # without parameters; rejecting it left a hang-up unexecuted
+                args_dict = {}
+            else:
+                logger.error(
+                    f"error parsing arguments for `{fnc.info.name}`",
+                    extra={"function": fnc.info.name, "lk.pii.arguments": json_arguments},
+                )
+                raise ToolError(f"Error parsing arguments for `{fnc.info.name}`: {e}") from e
 
         # write canonical BEFORE validation so a downstream validation failure
         # still leaves valid JSON in chat history
