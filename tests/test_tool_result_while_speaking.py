@@ -11,8 +11,8 @@ import asyncio
 
 import pytest
 
-from livekit.agents import Agent, AgentSession, function_tool
-from livekit.agents.llm import FunctionCall
+from livekit.agents import Agent, AgentSession, function_tool, utils
+from livekit.agents.llm import FunctionCall, MessageGeneration
 
 from .fake_io import FakeAudioOutput
 from .fake_realtime import FakeRealtimeModel, fake_capabilities
@@ -106,7 +106,11 @@ async def test_other_models_get_results_once_every_speech_has_played() -> None:
 
 
 async def _second_result_sent(
-    *, model_answers_the_first: bool, interrupt_the_second: bool = False
+    *,
+    model_answers_the_first: bool,
+    interrupt_the_second: bool = False,
+    nonanswer: str | None = None,
+    wait_after: float = 10.0,
 ) -> tuple[bool, bool]:
     """Whether the second result went out while the answer to the first played, and after."""
     model = FakeRealtimeModel(
@@ -130,6 +134,11 @@ async def _second_result_sent(
             await release["contacts"].wait()
             return "Erika Muster"
 
+        @function_tool
+        async def running_tasks(self) -> None:
+            """Check the running tasks without requesting a spoken reply."""
+            return None
+
     async with AgentSession(llm=model) as session:
         session.output.audio = FakeAudioOutput()
         await session.start(TwoToolAgent())
@@ -152,6 +161,28 @@ async def _second_result_sent(
         release["dates"].set()
         await asyncio.sleep(0.5)
         assert _sent_outputs(model) == ["dates"]
+        if nonanswer is not None:
+            interim = _generation(
+                response_id="interim",
+                text="still looking" if nonanswer == "continuing" else "",
+                audio_duration=0.5 if nonanswer == "continuing" else 0.0,
+                function_calls=[
+                    FunctionCall(call_id="running", name="running_tasks", arguments="{}")
+                ]
+                if nonanswer == "tool-only"
+                else [],
+            )
+            interim.user_initiated = False
+            interim.is_final = nonanswer != "continuing"
+            if nonanswer != "continuing":
+                # No zero-sample audio frame: the provider closes an empty stream.
+                empty_messages = utils.aio.Chan[MessageGeneration]()
+                empty_messages.close()
+                interim.message_stream = empty_messages
+            model.active_session.emit("generation_created", interim)
+            release["contacts"].set()
+            await asyncio.sleep(2.0)
+            assert "contacts" not in _sent_outputs(model)
         if model_answers_the_first:
             answer = _generation(response_id="answer", text="the dates are", audio_duration=10.0)
             answer.user_initiated = False
@@ -165,7 +196,7 @@ async def _second_result_sent(
             handles[1].interrupt(force=True)
         await asyncio.sleep(2.0)
         during = "contacts" in _sent_outputs(model)
-        await asyncio.sleep(10.0)
+        await asyncio.sleep(wait_after)
         return during, "contacts" in _sent_outputs(model)
 
 
@@ -183,3 +214,17 @@ async def test_the_next_result_survives_an_interruption_of_its_speech() -> None:
         False,
         True,
     )
+
+
+@pytest.mark.parametrize("nonanswer", ["tool-only", "continuing", "empty"])
+async def test_a_nonanswer_does_not_release_the_next_tool_result(nonanswer: str) -> None:
+    assert await _second_result_sent(model_answers_the_first=True, nonanswer=nonanswer) == (
+        False,
+        True,
+    )
+
+
+async def test_the_next_result_is_not_held_forever_by_a_continuing_interaction() -> None:
+    assert await _second_result_sent(
+        model_answers_the_first=False, nonanswer="continuing", wait_after=65.0
+    ) == (False, True)

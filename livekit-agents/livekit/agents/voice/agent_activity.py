@@ -536,7 +536,8 @@ class AgentActivity(RecognitionHooks):
         # a model that takes tool results while it speaks answers only the first of two that
         # meet (gemini-3.8-live, which rejects `scheduling`), so they go out one at a time
         self._tool_result_slot = asyncio.Lock()
-        self._tool_result_reply_fut: asyncio.Future[SpeechHandle] | None = None
+        self._tool_result_reply_fut: asyncio.Future[None] | None = None
+        self._tool_result_reply_started: asyncio.Event | None = None
         self._tool_result_send_tasks: set[asyncio.Task[None]] = set()
 
     def _resolve_rt_turn_detection_enabled(self) -> bool:
@@ -2552,19 +2553,20 @@ class AgentActivity(RecognitionHooks):
             SpeechCreatedEvent(speech_handle=handle, user_initiated=False, source="generate_reply"),
         )
 
+        tool_result_reply_fut = self._tool_result_reply_fut
+        if self._tool_result_reply_started is not None:
+            self._tool_result_reply_started.set()
+
         self._create_speech_task(
             self._realtime_generation_task(
                 speech_handle=handle,
                 generation_ev=ev,
                 model_settings=ModelSettings(),
+                tool_result_reply_fut=tool_result_reply_fut,
             ),
             speech_handle=handle,
             name="AgentActivity.realtime_generation",
         )
-
-        if (reply_fut := self._tool_result_reply_fut) and not reply_fut.done():
-            self._tool_result_reply_fut = None
-            reply_fut.set_result(handle)
 
         if (fut := self._pending_auto_tool_reply_fut) and not fut.done():
             if (run_state := self._session._global_run_state) is not None and not run_state.done():
@@ -4454,6 +4456,7 @@ class AgentActivity(RecognitionHooks):
         generation_ev: llm.GenerationCreatedEvent,
         model_settings: ModelSettings,
         instructions: str | None = None,
+        tool_result_reply_fut: asyncio.Future[None] | None = None,
     ) -> None:
         with _agent_turn(
             speech_handle,
@@ -4468,6 +4471,7 @@ class AgentActivity(RecognitionHooks):
                     model_settings=model_settings,
                     instructions=instructions,
                     inference_span=inference_span,
+                    tool_result_reply_fut=tool_result_reply_fut,
                 )
             finally:
                 # read last: the provider may fill it in after the generation opened
@@ -4485,6 +4489,7 @@ class AgentActivity(RecognitionHooks):
         model_settings: ModelSettings,
         instructions: str | None = None,
         inference_span: trace.Span,
+        tool_result_reply_fut: asyncio.Future[None] | None = None,
     ) -> None:
         current_span = trace.get_current_span(context=speech_handle._agent_turn_context)
         current_span.set_attribute(trace_types.ATTR_SPEECH_ID, speech_handle.id)
@@ -4873,6 +4878,22 @@ class AgentActivity(RecognitionHooks):
             await tee.aclose()
         speech_handle._mark_generation_done()
 
+        # A tool-only generation or an IN_PROGRESS utterance is not the answer. Waiting
+        # for its entire handle also includes its tools, whose results may need this slot.
+        if (
+            tool_result_reply_fut is not None
+            and not tool_result_reply_fut.done()
+            and generation_ev.is_final
+            and not function_calls
+            and not speech_handle.interrupted
+            and any(e.out.forwarded_text or e.out.playback_position > 0 for e in message_outputs)
+        ):
+            tool_result_reply_fut.set_result(None)
+            logger.debug(
+                "background tool result answer has played",
+                extra={"response_id": generation_ev.response_id},
+            )
+
         if speech_handle.interrupted:
             await utils.aio.cancel_and_wait(exe_task)
 
@@ -5069,20 +5090,23 @@ class AgentActivity(RecognitionHooks):
         Gemini 3.8 answers one tool result; a second that arrives while it answers the first
         is dropped, so the caller never hears it. Its API would take `scheduling: WHEN_IDLE`
         for this, but the model rejects the field, so the wait happens here: the next results
-        go out once the generation answering these has played, or when none starts in time.
+        go out once a final answer has played, or when none starts in time.
         """
         async with self._tool_result_slot:
-            reply_fut: asyncio.Future[SpeechHandle] = asyncio.get_running_loop().create_future()
+            reply_fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            reply_started = asyncio.Event()
             self._tool_result_reply_fut = reply_fut
+            self._tool_result_reply_started = reply_started
             try:
                 await send()
-                reply = await asyncio.wait_for(reply_fut, _TOOL_RESULT_REPLY_START_TIMEOUT)
-                await asyncio.wait_for(reply.wait_for_playout(), _TOOL_RESULT_REPLY_PLAYOUT_TIMEOUT)
+                await asyncio.wait_for(reply_started.wait(), _TOOL_RESULT_REPLY_START_TIMEOUT)
+                await asyncio.wait_for(reply_fut, _TOOL_RESULT_REPLY_PLAYOUT_TIMEOUT)
             except asyncio.TimeoutError:
                 logger.debug("sending the next tool result without an answer to the last one")
             finally:
                 if self._tool_result_reply_fut is reply_fut:
                     self._tool_result_reply_fut = None
+                    self._tool_result_reply_started = None
 
     def _disallow_interruptions(self, speech_handle: SpeechHandle) -> None:
         speech_handle.allow_interruptions = False

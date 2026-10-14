@@ -61,6 +61,12 @@ class GenerationCreatedEvent:
 
     The provider may fill it in after emitting the event, until the generation ends: the end
     of speech can arrive just after what opened the generation."""
+    is_final: bool = True
+    """Whether this generation finishes the provider's interaction.
+
+    A provider may update this until it closes the generation streams. False for an
+    intermediate utterance when reasoning or tools continue after its audio ends.
+    """
 
 
 class RealtimeModelError(BaseModel):

@@ -1737,6 +1737,8 @@ class RealtimeSession(llm.RealtimeSession):
             self._interaction_in_progress = (
                 server_content.interaction_status == types.InteractionStatus.IN_PROGRESS
             )
+            if current_gen.generation_event is not None:
+                current_gen.generation_event.is_final = not self._interaction_in_progress
             self._mark_current_generation_done()
 
     def _mark_current_generation_done(self) -> None:
