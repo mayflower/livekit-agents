@@ -97,6 +97,19 @@ MODELS_WITH_TRANSCRIPT_IN_STEP: tuple[str, ...] = (
 )
 
 
+# Models that run a tool in the background with `tool_behavior` unset, talking on while it
+# runs: measured on gemini-3.8-live 2026-09-23 and in a live call 2026-10-06.
+MODELS_RUNNING_TOOLS_IN_THE_BACKGROUND: tuple[str, ...] = ("gemini-3.8-live",)
+
+
+def _takes_tool_results_while_speaking(
+    model: str, tool_behavior: NotGivenOr[types.Behavior]
+) -> bool:
+    if is_given(tool_behavior):
+        return tool_behavior == types.Behavior.NON_BLOCKING
+    return model in MODELS_RUNNING_TOOLS_IN_THE_BACKGROUND
+
+
 def _needs_reply_placeholder(model: str) -> bool:
     return not any(tag in model for tag in MODELS_WITHOUT_REPLY_PLACEHOLDER)
 
@@ -412,6 +425,9 @@ class RealtimeModel(llm.RealtimeModel):
                 mutable_tools=False,
                 per_response_tool_choice=False,
                 audio_transcript_in_step=model in MODELS_WITH_TRANSCRIPT_IN_STEP,
+                takes_tool_results_while_speaking=_takes_tool_results_while_speaking(
+                    model, tool_behavior
+                ),
             )
         )
 
@@ -529,6 +545,9 @@ class RealtimeModel(llm.RealtimeModel):
 
         if is_given(tool_behavior):
             self._opts.tool_behavior = tool_behavior
+            self._capabilities.takes_tool_results_while_speaking = (
+                _takes_tool_results_while_speaking(self._opts.model, tool_behavior)
+            )
 
         if is_given(tool_response_scheduling):
             self._opts.tool_response_scheduling = tool_response_scheduling

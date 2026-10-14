@@ -1772,3 +1772,17 @@ async def test_a_barge_in_after_the_reply_finished_is_still_ended_after_a_reconn
 
         second.deliver(_CALLER, _REPLY_AGAIN, _DONE)
         await _until(lambda: seen.stops() == 2)
+
+
+def test_tool_results_go_out_while_speaking_where_the_model_runs_tools_in_the_background() -> None:
+    from google.genai import types
+
+    from livekit.agents import NOT_GIVEN
+    from livekit.plugins.google.realtime.realtime_api import _takes_tool_results_while_speaking
+
+    assert _takes_tool_results_while_speaking("gemini-3.8-live", NOT_GIVEN)
+    assert not _takes_tool_results_while_speaking("gemini-3.8-live", types.Behavior.BLOCKING)
+    assert _takes_tool_results_while_speaking(
+        "gemini-3.8-live-extended-thinking", types.Behavior.NON_BLOCKING
+    )
+    assert not _takes_tool_results_while_speaking("gemini-3.8-live-extended-thinking", NOT_GIVEN)
