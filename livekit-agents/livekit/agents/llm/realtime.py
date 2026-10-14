@@ -111,6 +111,10 @@ class RealtimeCapabilities:
     """Whether the transcript of the model's audio streams in step with the audio, each part
     arriving with the speech it transcribes. A cut can then tell from the text and audio that
     have arrived how far the caller heard, while the reply is still streaming"""
+    takes_tool_results_while_speaking: bool = False
+    """Whether the model takes a tool result while it speaks and decides itself when to answer
+    it, as Gemini does for a tool it runs in the background. The framework then sends a result
+    as soon as its tool returns, instead of holding it until every other speech has played"""
 
 
 class RealtimeError(Exception):
