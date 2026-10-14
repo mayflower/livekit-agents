@@ -4,13 +4,14 @@ import asyncio
 import json
 import weakref
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from typing_extensions import TypedDict
 
 from .. import utils
 from ..llm.chat_context import ChatContext, ChatItem
+from ..llm.realtime import RealtimeError
 from ..llm.tool_context import (
     CONFIRM_DUPLICATE_PARAM,
     DuplicateMode,
@@ -265,6 +266,19 @@ class _PendingUpdate:
     ctx: RunContext
     items: list[ChatItem]
     target: Agent  # agent that received the eager chat_ctx insert
+    refusals: int = 0  # replies for these items the provider refused so far
+
+
+# OpenAI's refusal of a `response.create` while a response is already active.
+# `wait_for_response_slot` cannot prevent all of them: a server-VAD response the
+# server starts as the caller stops speaking is known here only from its
+# `response.created`, which can arrive after our request went out.
+_REFUSED_FOR_ACTIVE_RESPONSE = "conversation_already_has_active_response"
+
+# How often a refused reply is asked for again. The retry waits for idle and for
+# the provider's slot like the first attempt, so it lands after the response that
+# won; the bound only stops a provider that keeps refusing.
+_MAX_REPLY_REFUSALS = 2
 
 
 class _ToolExecutor:
@@ -544,13 +558,15 @@ class _ToolExecutor:
         ctx.session.history.insert(items)
 
         self._pending_updates.append(_PendingUpdate(ctx=ctx, items=items, target=target))
+        self._schedule_delivery(ctx.session)
 
+    def _schedule_delivery(self, session: AgentSession) -> None:
         if self._reply_task is None or self._reply_task.done():
             self._reply_task = asyncio.create_task(
-                self._deliver_reply(ctx.session), name="tool_executor_deliver_reply"
+                self._deliver_reply(session), name="tool_executor_deliver_reply"
             )
             # let an active RunResult wait for the deferred reply to land
-            run_state = ctx.session._global_run_state
+            run_state = session._global_run_state
             if run_state is not None:
                 run_state._watch_handle(self._reply_task)
 
@@ -654,6 +670,9 @@ class _ToolExecutor:
         )
 
         def _on_speech_done(speech: SpeechHandle) -> None:
+            if self._retry_refused_reply(speech, updates, session):
+                return
+
             reply_status: Literal["completed", "interrupted", "skipped"]
             if speech.interrupted:
                 reply_status = "interrupted"
@@ -679,6 +698,42 @@ class _ToolExecutor:
             )
 
         speech.add_done_callback(_on_speech_done)
+
+    def _retry_refused_reply(
+        self, speech: SpeechHandle, updates: list[_PendingUpdate], session: AgentSession
+    ) -> bool:
+        """Ask again for a reply the provider refused because it was busy.
+
+        Without this a refusal is terminal: the updates were taken off the queue
+        before the reply was requested, the speech ends without output, and
+        `_on_speech_done` reports it `skipped`, as if the model had judged the
+        result covered. The caller never hears the result, though it sits in the
+        chat context. The retry goes through `_deliver_reply` again, so it waits
+        for the response that won and is then spoken from the not-at-tail
+        template. The refused speech reports no status; the retry reports its own.
+        """
+        error = speech.exception()
+        if not (isinstance(error, RealtimeError) and error.code == _REFUSED_FOR_ACTIVE_RESPONSE):
+            return False
+        if any(u.refusals >= _MAX_REPLY_REFUSALS for u in updates):
+            return False
+
+        logger.warning(
+            "the provider refused the reply for a finished tool result, asking again",
+            extra={
+                "speech_id": speech.id,
+                "call_ids": [
+                    item.call_id
+                    for u in updates
+                    for item in u.items
+                    if item.type == "function_call_output"
+                ],
+            },
+        )
+        # ahead of anything queued meanwhile, so the results keep their order
+        self._pending_updates[:0] = [replace(u, refusals=u.refusals + 1) for u in updates]
+        self._schedule_delivery(session)
+        return True
 
     async def _check_duplicate(
         self,
