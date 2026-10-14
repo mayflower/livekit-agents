@@ -122,6 +122,11 @@ _IdleHoldContextVar = contextvars.ContextVar[bool]("agents_idle_hold", default=F
 # enough that a lost stop event costs one exchange rather than the call. Only
 # reached when a speech-start is never paired.
 _UNPAIRED_SPEECH_TIMEOUT = 60.0
+# How long a model that takes tool results while it speaks may take to start answering one
+# before the next goes out anyway, and how long its answer may play.
+_TOOL_RESULT_REPLY_START_TIMEOUT = 5.0
+# ponytail: a fixed cap so a reply that never ends cannot hold later results forever
+_TOOL_RESULT_REPLY_PLAYOUT_TIMEOUT = 60.0
 _RECONNECT_ARMED_ATTR = "_lk_reconnect_speech_release_armed"
 
 
@@ -527,6 +532,12 @@ class AgentActivity(RecognitionHooks):
         # placeholder used to hold a RunResult open while waiting for a realtime
         # model to auto-generate a tool reply (auto_tool_reply_generation=True).
         self._pending_auto_tool_reply_fut: asyncio.Future[None] | None = None
+
+        # a model that takes tool results while it speaks answers only the first of two that
+        # meet (gemini-3.8-live, which rejects `scheduling`), so they go out one at a time
+        self._tool_result_slot = asyncio.Lock()
+        self._tool_result_reply_fut: asyncio.Future[SpeechHandle] | None = None
+        self._tool_result_send_tasks: set[asyncio.Task[None]] = set()
 
     def _resolve_rt_turn_detection_enabled(self) -> bool:
         """Whether a realtime model's server-side turn detection is on for this session.
@@ -1730,6 +1741,7 @@ class AgentActivity(RecognitionHooks):
 
             if self._scheduling_atask is not None:
                 await utils.aio.cancel_and_wait(self._scheduling_atask)
+            await utils.aio.cancel_and_wait(*self._tool_result_send_tasks)
 
             # session-scoped toolsets are closed by the session; this only closes
             # the agent's own toolsets + MCP — all of which outlive pause
@@ -2549,6 +2561,10 @@ class AgentActivity(RecognitionHooks):
             speech_handle=handle,
             name="AgentActivity.realtime_generation",
         )
+
+        if (reply_fut := self._tool_result_reply_fut) and not reply_fut.done():
+            self._tool_result_reply_fut = None
+            reply_fut.set_result(handle)
 
         if (fut := self._pending_auto_tool_reply_fut) and not fut.done():
             if (run_state := self._session._global_run_state) is not None and not run_state.done():
@@ -4959,46 +4975,57 @@ class AgentActivity(RecognitionHooks):
                     else:
                         await asyncio.sleep(0)
 
-                # if the realtime model auto-generates the tool reply, install a
-                # placeholder so the active RunResult waits for that reply
-                auto_reply_fut: asyncio.Future[None] | None = None
-                if (
-                    self._rt_session.capabilities.auto_tool_reply_generation
-                    and fnc_executed_ev.has_tool_reply
-                    and self._pending_auto_tool_reply_fut is None
-                    and (run_state := self._session._global_run_state) is not None
-                    and not run_state.done()
-                ):
-                    auto_reply_fut = asyncio.get_event_loop().create_future()
-                    self._pending_auto_tool_reply_fut = auto_reply_fut
-                    llm_label = self.llm._label
+                async def _send() -> None:
+                    # if the realtime model auto-generates the tool reply, install a
+                    # placeholder so the active RunResult waits for that reply
+                    auto_reply_fut: asyncio.Future[None] | None = None
+                    if (
+                        self._rt_session.capabilities.auto_tool_reply_generation
+                        and fnc_executed_ev.has_tool_reply
+                        and self._pending_auto_tool_reply_fut is None
+                        and (run_state := self._session._global_run_state) is not None
+                        and not run_state.done()
+                    ):
+                        auto_reply_fut = asyncio.get_event_loop().create_future()
+                        self._pending_auto_tool_reply_fut = auto_reply_fut
+                        llm_label = self.llm._label
 
-                    async def _wait_for_auto_tool_reply() -> None:
-                        try:
-                            await asyncio.wait_for(asyncio.shield(auto_reply_fut), 5.0)
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                "timed out waiting for realtime auto tool reply from %s",
-                                llm_label,
-                            )
-                        finally:
+                        async def _wait_for_auto_tool_reply() -> None:
+                            try:
+                                await asyncio.wait_for(asyncio.shield(auto_reply_fut), 5.0)
+                            except asyncio.TimeoutError:
+                                logger.warning(
+                                    "timed out waiting for realtime auto tool reply from %s",
+                                    llm_label,
+                                )
+                            finally:
+                                if self._pending_auto_tool_reply_fut is auto_reply_fut:
+                                    self._pending_auto_tool_reply_fut = None
+
+                        task = asyncio.create_task(_wait_for_auto_tool_reply())
+                        run_state._watch_handle(task)
+
+                    try:
+                        await self._rt_session.update_chat_ctx_with(_appending(new_fnc_outputs))
+                    except llm.RealtimeError as e:
+                        logger.warning(
+                            "failed to update chat context before generating the function calls results",  # noqa: E501
+                            extra={"error": str(e)},
+                        )
+                        if auto_reply_fut is not None and not auto_reply_fut.done():
                             if self._pending_auto_tool_reply_fut is auto_reply_fut:
                                 self._pending_auto_tool_reply_fut = None
+                            auto_reply_fut.set_result(None)
 
-                    task = asyncio.create_task(_wait_for_auto_tool_reply())
-                    run_state._watch_handle(task)
-
-                try:
-                    await self._rt_session.update_chat_ctx_with(_appending(new_fnc_outputs))
-                except llm.RealtimeError as e:
-                    logger.warning(
-                        "failed to update chat context before generating the function calls results",  # noqa: E501
-                        extra={"error": str(e)},
-                    )
-                    if auto_reply_fut is not None and not auto_reply_fut.done():
-                        if self._pending_auto_tool_reply_fut is auto_reply_fut:
-                            self._pending_auto_tool_reply_fut = None
-                        auto_reply_fut.set_result(None)
+                if (
+                    self._rt_session.capabilities.takes_tool_results_while_speaking
+                    and fnc_executed_ev.has_tool_reply
+                ):
+                    # not awaited: the wait is the model's, and a speech that the next
+                    # generation interrupts is cancelled within seconds, its result with it
+                    self._send_tool_results_in_turn(_send)
+                else:
+                    await _send()
 
             tool_reply_expected = fnc_executed_ev.has_tool_reply
             if tool_reply_expected and not self._rt_session.capabilities.auto_tool_reply_generation:
@@ -5028,6 +5055,34 @@ class AgentActivity(RecognitionHooks):
             self._session._update_agent_state(
                 "thinking" if self._background_speeches else "listening"
             )
+
+    def _send_tool_results_in_turn(self, send: Callable[[], Coroutine[Any, Any, None]]) -> None:
+        task = asyncio.create_task(self._send_tool_results_after_the_last_answer(send))
+        self._tool_result_send_tasks.add(task)
+        task.add_done_callback(self._tool_result_send_tasks.discard)
+
+    async def _send_tool_results_after_the_last_answer(
+        self, send: Callable[[], Coroutine[Any, Any, None]]
+    ) -> None:
+        """Send tool results once the model has answered the ones sent before.
+
+        Gemini 3.8 answers one tool result; a second that arrives while it answers the first
+        is dropped, so the caller never hears it. Its API would take `scheduling: WHEN_IDLE`
+        for this, but the model rejects the field, so the wait happens here: the next results
+        go out once the generation answering these has played, or when none starts in time.
+        """
+        async with self._tool_result_slot:
+            reply_fut: asyncio.Future[SpeechHandle] = asyncio.get_running_loop().create_future()
+            self._tool_result_reply_fut = reply_fut
+            try:
+                await send()
+                reply = await asyncio.wait_for(reply_fut, _TOOL_RESULT_REPLY_START_TIMEOUT)
+                await asyncio.wait_for(reply.wait_for_playout(), _TOOL_RESULT_REPLY_PLAYOUT_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.debug("sending the next tool result without an answer to the last one")
+            finally:
+                if self._tool_result_reply_fut is reply_fut:
+                    self._tool_result_reply_fut = None
 
     def _disallow_interruptions(self, speech_handle: SpeechHandle) -> None:
         speech_handle.allow_interruptions = False
