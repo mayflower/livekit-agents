@@ -145,6 +145,29 @@ def _appending(
     return _produce
 
 
+def _only_acks_of_returned_tools(
+    session: AgentSession, outputs: Sequence[ToolExecutionOutput]
+) -> bool:
+    """Whether every output that asks for a reply is the ack of a tool that has
+    since returned.
+
+    A tool released to the background hands its turn the ack it gave
+    (``RunContext.update``) instead of its result; the turn's reply exists to
+    announce that wait. The turn only gets there once the speech before it has
+    played, and by then a short tool may have returned: its result is already
+    queued for the deferred reply, which speaks it. The announcement would be
+    stale, and the `interrupt()` that clears the floor for it is session-wide,
+    so it would also cancel that deferred reply as it starts.
+    """
+    running = _RunningTasks.get(session, {})
+    asking = [out for out in outputs if out.fnc_call_out.reply_required]
+    return bool(asking) and all(
+        out.fnc_call.extra.get("__livekit_agents_tool_non_blocking", False)
+        and out.fnc_call.call_id not in running
+        for out in asking
+    )
+
+
 async def _aligned_transcript_or_text(
     timed_texts: AsyncIterable[str], text: AsyncIterable[str]
 ) -> AsyncGenerator[str, None]:
@@ -4996,6 +5019,17 @@ class AgentActivity(RecognitionHooks):
                         auto_reply_fut.set_result(None)
 
             tool_reply_expected = fnc_executed_ev.has_tool_reply
+            if (
+                tool_reply_expected
+                and not self._rt_session.capabilities.auto_tool_reply_generation
+                and _only_acks_of_returned_tools(self._session, tool_output.output)
+            ):
+                logger.debug(
+                    "skipping the tool reply: every tool it would announce has returned, "
+                    "and the deferred reply speaks the result",
+                    extra={"speech_id": speech_handle.id},
+                )
+                tool_reply_expected = False
             if tool_reply_expected and not self._rt_session.capabilities.auto_tool_reply_generation:
                 self._rt_session.interrupt()
 
