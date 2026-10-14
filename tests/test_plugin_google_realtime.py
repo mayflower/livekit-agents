@@ -1321,6 +1321,28 @@ async def test_a_barge_in_ends_a_turn_the_server_still_called_in_progress(
         assert started == [False]
 
 
+@pytest.mark.parametrize(
+    ("status", "is_final"),
+    [
+        (types.InteractionStatus.IN_PROGRESS, False),
+        (types.InteractionStatus.IDLE, True),
+        (None, True),
+    ],
+)
+async def test_generation_reports_whether_it_finishes_the_interaction(
+    monkeypatch: pytest.MonkeyPatch, status: types.InteractionStatus | None, is_final: bool
+) -> None:
+    async with _make_session(monkeypatch) as session:
+        session._start_new_generation()
+        gen = session._current_generation
+        assert gen is not None and gen.generation_event is not None
+        session._handle_server_content(types.LiveServerContent(generation_complete=True))
+        session._handle_server_content(
+            types.LiveServerContent(turn_complete=True, interaction_status=status)
+        )
+        assert gen.generation_event.is_final is is_final
+
+
 class _RecordingLiveSession(_FakeLiveSession):
     """Also records `turn_complete`, and can open with a tool call."""
 
