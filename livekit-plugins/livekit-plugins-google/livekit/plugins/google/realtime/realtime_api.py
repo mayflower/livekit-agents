@@ -1030,7 +1030,10 @@ class RealtimeSession(llm.RealtimeSession):
 
         turns = []
         if is_given(instructions):
-            turns.append(types.Content(parts=[types.Part(text=instructions)], role="model"))
+            # A user turn, not a model turn: as a model turn the instructions read as
+            # something the model has already said, and 3.8 carries on from them,
+            # speaking meta text, JSON or another language in place of the reply.
+            turns.append(types.Content(parts=[types.Part(text=instructions)], role="user"))
         if _needs_reply_placeholder(self._opts.model) or not turns:
             # ``or not turns``: the models above are spared the placeholder because they
             # answer it with an empty turn, but a turn-less LiveClientContent leaves them
