@@ -1216,6 +1216,24 @@ async def test_instructions_reach_the_model_without_a_placeholder(
         assert _texts(fake.sent)[-1] == ["Sag Hallo."]
 
 
+async def test_instructions_reach_the_model_as_a_user_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sent as a model turn, the instructions read as something the model has
+    already said, and it carries on from them: asked to check on a silent caller
+    in a German call, 3.8 spoke "As speaker, you must speak now.", English meta
+    text, JSON or Chinese in place of the question."""
+    async with _connected_session(monkeypatch, handle=None, model="gemini-3.8-live") as (
+        session,
+        fake,
+    ):
+        session.generate_reply(instructions="Sag Hallo.")
+        await asyncio.sleep(0.05)
+
+        turns = [turns for kind, turns in fake.sent if kind == "content"][-1]
+        assert [t.role for t in turns] == ["user"]  # type: ignore[attr-defined]
+
+
 async def test_an_unrequested_caller_transcript_is_not_reported(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
