@@ -109,6 +109,7 @@ async def _second_result_sent(
     *,
     model_answers_the_first: bool,
     interrupt_the_second: bool = False,
+    interrupt_the_answer: bool = False,
     nonanswer: str | None = None,
     wait_after: float = 10.0,
 ) -> tuple[bool, bool]:
@@ -188,6 +189,10 @@ async def _second_result_sent(
             answer.user_initiated = False
             model.active_session.emit("generation_created", answer)
             await asyncio.sleep(0.5)
+            if interrupt_the_answer:
+                # the caller cuts in with a new question: the answer stops for good
+                session.interrupt(force=True)
+                await asyncio.sleep(0.5)
 
         release["contacts"].set()
         if interrupt_the_second:
@@ -212,6 +217,13 @@ async def test_the_next_result_goes_out_when_the_last_gets_no_answer() -> None:
 async def test_the_next_result_survives_an_interruption_of_its_speech() -> None:
     assert await _second_result_sent(model_answers_the_first=True, interrupt_the_second=True) == (
         False,
+        True,
+    )
+
+
+async def test_the_next_result_goes_out_once_the_caller_interrupts_the_answer() -> None:
+    assert await _second_result_sent(model_answers_the_first=True, interrupt_the_answer=True) == (
+        True,
         True,
     )
 

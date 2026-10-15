@@ -4903,17 +4903,25 @@ class AgentActivity(RecognitionHooks):
 
         # A tool-only generation or an IN_PROGRESS utterance is not the answer. Waiting
         # for its entire handle also includes its tools, whose results may need this slot.
+        # An interrupted one ends the answer for good: the caller has the turn, and holding
+        # the next result until the playout cap leaves it unsent while the caller waits.
         if (
             tool_result_reply_fut is not None
             and not tool_result_reply_fut.done()
-            and generation_ev.is_final
-            and not function_calls
-            and not speech_handle.interrupted
-            and any(e.out.forwarded_text or e.out.playback_position > 0 for e in message_outputs)
+            and (
+                speech_handle.interrupted
+                or (
+                    generation_ev.is_final
+                    and not function_calls
+                    and any(
+                        e.out.forwarded_text or e.out.playback_position > 0 for e in message_outputs
+                    )
+                )
+            )
         ):
             tool_result_reply_fut.set_result(None)
             logger.debug(
-                "background tool result answer has played",
+                "background tool result answer has ended",
                 extra={"response_id": generation_ev.response_id},
             )
 
