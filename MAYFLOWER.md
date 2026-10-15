@@ -66,11 +66,11 @@ repository settings.
 
 ## What is patched
 
-Thirty-four commits in twenty-five entries against eleven defect classes: **a
-finished tool result never reaching the caller** (1–4), **a Gemini session dropped
-for no reason** (5–6, 12), **a finished reply the session will not let out** (7,
-13), **a caller transcript that is not the one the session asked for** (8, 11,
-14), **a prompt change the model never takes as its instruction** (15), **a billed
+Forty-one commits in twenty-nine entries against eleven defect classes: **a
+finished tool result never reaching the caller** (1–4, 26–28), **a Gemini session
+dropped for no reason** (5–6, 12), **a finished reply the session will not let
+out** (7, 13), **a caller transcript that is not the one the session asked for**
+(8, 11, 14), **an instruction the model does not take as one** (15, 29), **a billed
 token nobody counts** (9), **a request the provider is given nothing to answer**
 (10), **a spoken sentence the trace loses** (16, 21, 24), **a turn the trace times
 wrong** (17–20, 22), **a reconnect nobody hears of** (23), and **a tool call
@@ -978,6 +978,120 @@ function tool, whose schema is its own.
 `parse_function_arguments` failure into a `ToolError`? Still so in
 `livekit-agents@1.8.6`. If upstream starts accepting an empty payload for a
 parameterless tool, drop this.
+
+### 26. A deferred tool reply the provider refuses as busy is never asked for again
+
+*Files: `voice/tool_executor.py`*
+
+OpenAI refuses a `response.create` while a response is active, with
+`conversation_already_has_active_response`. `_deliver_reply` waits for idle and
+for the provider's response slot before it asks, but a server-VAD response the
+server starts as the caller stops speaking is known here only from its
+`response.created`, and that can arrive after the request went out: 7 ms after,
+in the local call this was found in. The refusal was terminal. `_deliver_reply`
+had already taken the updates off the queue, the speech ended without output,
+and `_on_speech_done` reported it `skipped`, which reads as "the model judged the
+result covered". The caller never heard the knowledge-base result their question
+had triggered, though it sat in the chat context.
+
+A refused reply now puts its updates back at the head of the queue and goes
+through `_deliver_reply` again, which waits for the response that won, so the
+result is spoken right after it from the not-at-tail template. Only this error
+code is retried, at most twice: any other failure is not a busy provider. The
+refused speech reports no status; the retry reports its own.
+
+*Porting checks:* does `_deliver_reply` still clear `_pending_updates` before it
+requests the reply? Does OpenAI still use this error code? Still so in
+`livekit-agents@1.8.8`.
+
+### 27. A background tool's announcement cancels the reply that speaks its result
+
+*Files: `voice/agent_activity.py`*
+
+A realtime turn whose tool went to the background ends with the tool's ack as its
+output, and replies to announce the wait. It first waits for the speech before it
+to play, and a short tool can return in that time: its result is then already
+queued for the deferred reply. The turn still issued its announcement, and the
+`interrupt()` that clears the floor for it is session-wide, so it cancelled the
+deferred reply as it started. In one local call it happened twice: the deferred
+reply was cancelled 150 ms after its `response.create` and reported `skipped`,
+and the caller heard the turn's reply, which had no instructions for the result
+it ended up covering.
+
+When every output that asks for a reply is the ack of a tool no longer in
+`_RunningTasks`, the turn skips its reply and the interrupt, and the deferred
+reply speaks the result (`_only_acks_of_returned_tools`). Models that generate
+their own tool reply (`auto_tool_reply_generation`) are untouched.
+
+*Porting checks:* is the interrupt before a turn's tool reply still
+unconditional? Do background tools still mark their call with
+`__livekit_agents_tool_non_blocking` and leave `_RunningTasks` on return? Still
+so in `livekit-agents@1.8.8`.
+
+### 28. A background tool's result waits behind every other speech, and Gemini drops it
+
+*Files: `llm/realtime.py`, `voice/agent_activity.py`,
+`livekit-plugins-google/.../realtime/realtime_api.py`*
+
+`_realtime_generation_task_impl` holds a turn's tool results until every other
+speech has played (`while self._current_speech or self._speech_q`). On a model
+that runs tools in the background (Gemini 3.8 Live with no `tool_behavior`, or
+`NON_BLOCKING`) the caller keeps talking meanwhile, so a result is held behind the
+answer to a newer request and the tool that request called. Two results then
+reach the model back to back, and Gemini 3.8 answers one of them: a result that
+arrives while it answers another is dropped, though it sits in its context. It
+offers no way to queue one (`FunctionResponse.scheduling` closes the session,
+entry 12). Measured in voice-demo-solution's evals B-15 and B-15b (a lookup
+returns while the caller's newer request runs, or both have returned): 0 of 3
+each on `gemini-3.8-live`, the earlier result never spoken.
+
+`RealtimeCapabilities.takes_tool_results_while_speaking` marks such a model; the
+Google plugin sets it for `gemini-3.8-live` without `tool_behavior`, and for
+`NON_BLOCKING`, and recomputes it when `update_options` changes the behavior.
+With it, a result skips the wait and goes through a per-activity queue that sends
+one batch at a time and holds the next until the model's answer to the last has
+played. What counts as that answer:
+
+- a generation that is final (`GenerationCreatedEvent.is_final`, which the plugin
+  sets from Gemini's `interaction_status`: an `IN_PROGRESS` utterance is not),
+  calls no tool, and played audio or text, or
+- any generation the caller interrupts: the caller has the turn, and the answer
+  will not resume.
+
+The queue releases anyway when no answer starts within 5 s or none has played
+within 60 s. Its send runs as a detached task, so an interruption of the speech
+that owns the tool step cannot cancel a queued result, and `aclose` cancels
+what is left. Measured on `gemini-3.8-live`: B-15 3 of 4 and 2 of 2, B-15b 2 of 2
+twice; B-16 (the caller cuts into the answer to one result and asks for another)
+0 of 3 without the interruption rule, 2 of 2 with it, and three local phone calls
+where the second result is now spoken at once. OpenAI is unchanged: its
+capability stays `False`.
+
+*Porting checks:* does the realtime tool step still wait for
+`_current_speech`/`_speech_q` before sending results? Does Gemini 3.8 still drop a
+result that arrives while it answers another, and still reject `scheduling`? Is
+`interaction_status` still on the server content? Still so in
+`livekit-agents@1.8.8`; the model behaviour was measured on 2026-10-15.
+
+### 29. Reply instructions reach Gemini as words it already said
+
+*Files: `livekit-plugins-google/.../realtime/realtime_api.py`*
+
+`generate_reply(instructions=…)` sent the instructions as a `model`-role turn, so
+Gemini read them as something it had already said and carried on from them.
+Asked to check on a silent caller in a German call, `gemini-3.8-live` spoke "As
+speaker, you must speak now.", English reasoning about the instruction, or
+nothing; one local caller heard "Hallo, are you still there?". Probed with the
+same instruction, four runs each: as a `model` turn, meta text or silence; as a
+`model` turn naming the language, JSON, Chinese, meta text or silence; as a `user`
+turn, four clean German questions.
+
+The instructions now go as a `user` turn. `update_instructions` keeps its
+`model` role (entry 15): `system` is refused by both APIs, and that text is meant
+as standing instructions, not as a request to answer now.
+
+*Porting checks:* does `generate_reply` still put its instructions in a
+`LiveClientContent` turn? Still with `role="model"` in `livekit-agents@1.8.8`.
 
 ## Verifying a port
 
