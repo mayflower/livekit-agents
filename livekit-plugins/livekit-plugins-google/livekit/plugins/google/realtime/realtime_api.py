@@ -622,6 +622,10 @@ class RealtimeSession(llm.RealtimeSession):
         self._interaction_in_progress = False
         # an end of the caller's speech that no generation has answered yet
         self._input_speech_stopped_at: float | None = None
+        # an `input_speech_started` is out that no `input_speech_stopped` has ended yet
+        self._input_speech_open = False
+        # between the service's ACTIVITY_START and ACTIVITY_END for the caller
+        self._caller_voice_active = False
 
         self._session_resumption_handle: str | None = (
             self._opts.session_resumption.handle
@@ -1159,6 +1163,8 @@ class RealtimeSession(llm.RealtimeSession):
                     self._connected_once = True
                     # the speech the old connection ended is not what this one answers
                     self._input_speech_stopped_at = None
+                    # nor will its ACTIVITY_END come; the next generation ends an open turn
+                    self._caller_voice_active = False
                     async with self._session_lock:
                         self._active_session = session
 
@@ -1748,8 +1754,10 @@ class RealtimeSession(llm.RealtimeSession):
         if not self._current_generation or self._current_generation._done:
             return
 
-        # emit input_speech_stopped event after the generation is done
-        self._handle_input_speech_stopped()
+        # emit input_speech_stopped event after the generation is done, unless the service
+        # says the caller is still talking: then their ACTIVITY_END ends the turn
+        if self._input_speech_open and not self._caller_voice_active:
+            self._handle_input_speech_stopped()
 
         gen = self._current_generation
 
@@ -1807,38 +1815,58 @@ class RealtimeSession(llm.RealtimeSession):
         # The caller has the floor now, so the service's turn is over whether or
         # not it ever follows its last IN_PROGRESS with an IDLE.
         self._interaction_in_progress = False
+        self._input_speech_open = True
         self.emit(
             "input_speech_started",
             llm.InputSpeechStartedEvent(speech_detected=speech_detected),
         )
 
     def _handle_voice_activity(self, activity: types.VoiceActivity) -> None:
-        """Note when the service ends the caller's turn, for the generation that answers it.
+        """Take the caller's speech window from the service's own voice activity.
 
         Gemini 3.8 Live sends `voice_activity` unasked: ACTIVITY_START once the caller has
         started speaking, ACTIVITY_END once its silence window after the last word has
         passed, which is the end-of-turn decision.
 
+        The end is what ends the caller's speech. Ending it with the generation instead
+        held every reply after a barge-in back for as long as it plays: the session keeps a
+        reply's playout waiting while the caller speaks, and the service sends that reply's
+        `turn_complete` only once it thinks the reply has been played.
+
+        A start opens the caller's speech only while the agent is silent. An
+        `input_speech_started` also stops the agent's playout, and Gemini decides a barge-in
+        itself, with `server_content.interrupted`; over a reply, a requested one or a turn
+        the model is still working on, the start would cut off what Gemini lets go on.
+
         The time is when the end arrives, not its `audio_offset`: that counts from the start
         of this connection's audio stream, and reading it as wall time would take an
         unbroken stream sent in real time, which a reconnect's backlog breaks.
-
-        Recorded only. Turn taking stays on `server_content.interrupted` and the generation
-        lifecycle: `input_speech_started` stops the agent's playout and the pair holds back
-        queued replies while it lasts, so emitting them here as well would change both.
         """
         if activity.voice_activity_type == types.VoiceActivityType.ACTIVITY_START:
+            self._caller_voice_active = True
             # a new utterance; an end the service left unanswered is not this one's
             self._input_speech_stopped_at = None
+            gen = self._current_generation
+            if (
+                not self._input_speech_open
+                and (gen is None or gen._done)
+                and not self._pending_generation_fut
+                and not self._interaction_in_progress
+            ):
+                self._handle_input_speech_started()
         elif activity.voice_activity_type == types.VoiceActivityType.ACTIVITY_END:
+            self._caller_voice_active = False
             gen = self._current_generation
             if gen is not None and gen.generation_event and gen.answers_end_of_speech():
                 # opened by the caller's transcript, which arrives just ahead of the end
                 gen.generation_event.input_speech_stopped_at = time.time()
             else:
                 self._input_speech_stopped_at = time.time()
+            if self._input_speech_open:
+                self._handle_input_speech_stopped()
 
     def _handle_input_speech_stopped(self) -> None:
+        self._input_speech_open = False
         self.emit(
             "input_speech_stopped",
             llm.InputSpeechStoppedEvent(user_transcription_enabled=False),
