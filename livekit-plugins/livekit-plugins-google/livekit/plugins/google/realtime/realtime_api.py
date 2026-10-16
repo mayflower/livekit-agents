@@ -1679,6 +1679,7 @@ class RealtimeSession(llm.RealtimeSession):
                         continue
                     if not current_gen._first_token_timestamp:
                         current_gen._first_token_timestamp = time.time()
+                        self._end_caller_speech_answered_by(current_gen)
                     frame_data = part.inline_data.data
                     try:
                         if not isinstance(frame_data, bytes):
@@ -1756,7 +1757,7 @@ class RealtimeSession(llm.RealtimeSession):
 
         # emit input_speech_stopped event after the generation is done, unless the service
         # says the caller is still talking: then their ACTIVITY_END ends the turn
-        if self._input_speech_open and not self._caller_voice_active:
+        if not self._caller_voice_active:
             self._handle_input_speech_stopped()
 
         gen = self._current_generation
@@ -1855,17 +1856,36 @@ class RealtimeSession(llm.RealtimeSession):
             ):
                 self._handle_input_speech_started()
         elif activity.voice_activity_type == types.VoiceActivityType.ACTIVITY_END:
-            self._caller_voice_active = False
             gen = self._current_generation
             if gen is not None and gen.generation_event and gen.answers_end_of_speech():
                 # opened by the caller's transcript, which arrives just ahead of the end
                 gen.generation_event.input_speech_stopped_at = time.time()
             else:
                 self._input_speech_stopped_at = time.time()
-            if self._input_speech_open:
-                self._handle_input_speech_stopped()
+            self._end_caller_speech()
+
+    def _end_caller_speech_answered_by(self, gen: _ResponseGeneration) -> None:
+        """End the caller's speech once the service acts on it, if ACTIVITY_END has not.
+
+        The service answers only after it has ended the caller's turn, so its answer --
+        the first audio, or a tool call -- ends it too. Without this a lost ACTIVITY_END
+        would hold every reply back until the session's unpaired-speech backstop.
+
+        Not for a requested reply: that answers the request, and may well be speaking
+        while the caller starts to.
+        """
+        if gen.generation_event is None or gen.generation_event.user_initiated:
+            return
+        self._end_caller_speech()
+
+    def _end_caller_speech(self) -> None:
+        self._caller_voice_active = False
+        self._handle_input_speech_stopped()
 
     def _handle_input_speech_stopped(self) -> None:
+        # every stop closes an open start, and only one
+        if not self._input_speech_open:
+            return
         self._input_speech_open = False
         self.emit(
             "input_speech_stopped",
@@ -1934,6 +1954,7 @@ class RealtimeSession(llm.RealtimeSession):
                     arguments=arguments,
                 )
             )
+        self._end_caller_speech_answered_by(gen)
         self._mark_current_generation_done()
 
     def _handle_tool_call_cancellation(
