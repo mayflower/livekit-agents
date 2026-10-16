@@ -5027,12 +5027,18 @@ class AgentActivity(RecognitionHooks):
                     else:
                         await asyncio.sleep(0)
 
+                llm_label = self.llm._label
+
                 async def _send() -> None:
+                    # sent later when detached: the session may be closed by then
+                    rt_session = self._rt_session
+                    if rt_session is None:
+                        return
                     # if the realtime model auto-generates the tool reply, install a
                     # placeholder so the active RunResult waits for that reply
                     auto_reply_fut: asyncio.Future[None] | None = None
                     if (
-                        self._rt_session.capabilities.auto_tool_reply_generation
+                        rt_session.capabilities.auto_tool_reply_generation
                         and fnc_executed_ev.has_tool_reply
                         and self._pending_auto_tool_reply_fut is None
                         and (run_state := self._session._global_run_state) is not None
@@ -5040,7 +5046,6 @@ class AgentActivity(RecognitionHooks):
                     ):
                         auto_reply_fut = asyncio.get_event_loop().create_future()
                         self._pending_auto_tool_reply_fut = auto_reply_fut
-                        llm_label = self.llm._label
 
                         async def _wait_for_auto_tool_reply() -> None:
                             try:
@@ -5058,7 +5063,7 @@ class AgentActivity(RecognitionHooks):
                         run_state._watch_handle(task)
 
                     try:
-                        await self._rt_session.update_chat_ctx_with(_appending(new_fnc_outputs))
+                        await rt_session.update_chat_ctx_with(_appending(new_fnc_outputs))
                     except llm.RealtimeError as e:
                         logger.warning(
                             "failed to update chat context before generating the function calls results",  # noqa: E501
