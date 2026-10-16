@@ -1527,6 +1527,11 @@ async def _until(condition: Callable[[], bool], timeout: float = 5.0) -> None:
     await asyncio.wait_for(_wait(), timeout)
 
 
+def _answered(session: RealtimeSession, seen: _Seen, generations: int = 1) -> bool:
+    gen = session._current_generation
+    return len(seen.generations) == generations and gen is not None and gen._done
+
+
 def _voice_activity(kind: types.VoiceActivityType) -> types.LiveServerMessage:
     return types.LiveServerMessage(voice_activity=types.VoiceActivity(voice_activity_type=kind))
 
@@ -1575,7 +1580,7 @@ async def test_the_end_of_speech_the_service_reports_times_the_reply_to_it(
         seen = _Seen(session)
         before = time.time()
         socket.deliver(*messages)
-        await _until(lambda: seen.stops() == 1)
+        await _until(lambda: _answered(session, seen))
 
     [reply] = seen.generations
     assert reply.input_speech_stopped_at is not None
@@ -1618,7 +1623,7 @@ async def test_a_tool_turn_is_timed_on_the_generation_that_answered_the_caller(
         ctx.items.append(_tool_output())
         await session.update_chat_ctx(ctx)
         socket.deliver(_REPLY, _DONE)
-        await _until(lambda: len(seen.generations) == 2 and seen.stops() == 2)
+        await _until(lambda: _answered(session, seen, 2))
 
     tool_call, reply = seen.generations
     assert tool_call.input_speech_stopped_at is not None
@@ -1661,32 +1666,148 @@ async def test_an_end_of_speech_during_a_silent_requested_reply_is_not_that_repl
         seen = _Seen(session)
         session.generate_reply()
         socket.deliver(_THOUGHT, _START, _END, _REPLY, _DONE)
-        await _until(lambda: seen.stops() == 1)
+        await _until(lambda: _answered(session, seen))
 
     [reply] = seen.generations
     assert reply.user_initiated
     assert reply.input_speech_stopped_at is None
 
 
-async def test_voice_activity_leaves_the_turn_taking_alone(
+_REPLY_AGAIN = types.LiveServerMessage(
+    server_content=_audio_content(output_transcription=types.Transcription(text="Gut, danke."))
+)
+
+
+def _interrupted() -> types.LiveServerMessage:
+    # fresh each time: the plugin clears `interrupted` on the message it handled
+    return types.LiveServerMessage(server_content=types.LiveServerContent(interrupted=True))
+
+
+def _detected(session: RealtimeSession) -> list[bool]:
+    detected: list[bool] = []
+    session.on("input_speech_started", lambda ev: detected.append(ev.speech_detected))
+    return detected
+
+
+async def test_a_barge_in_ends_when_the_service_ends_the_callers_speech(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Recorded, never acted on.
+    """Not when the reply to it is done.
 
-    An `input_speech_started` stops the agent's playout, and both events latch whether the
-    caller is speaking, which holds back a queued reply. Gemini decides a barge-in itself
-    and says so with `server_content.interrupted`; reacting to its voice activity as well
+    Gemini holds `turn_complete` back until it thinks the reply has been played, and the
+    agent holds a reply back while the caller speaks: ending the caller's speech on the
+    reply's own `turn_complete` made every reply after a barge-in wait out its own length
+    before it played.
+    """
+    socket = _ScriptedLiveSession()
+    async with _connected_session(monkeypatch, handle=None, sockets=[socket]) as (session, _):
+        seen = _Seen(session)
+        socket.deliver(_REPLY, _DONE, _START, _interrupted(), _CALLER, _END, _REPLY_AGAIN)
+        await _until(lambda: len(seen.generations) == 2 and seen.stops() == 2)
+        answer = session._current_generation
+        assert answer is not None and not answer._done
+
+        socket.deliver(_DONE)
+        await _until(lambda: _answered(session, seen, 2))
+
+    assert seen.stops() == 2
+
+
+async def test_the_barged_in_reply_finishing_does_not_end_the_callers_speech(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The caller is still talking when the reply they cut off sends its `turn_complete`."""
+    socket = _ScriptedLiveSession()
+    async with _connected_session(monkeypatch, handle=None, sockets=[socket]) as (session, _):
+        seen = _Seen(session)
+        detected = _detected(session)
+        socket.deliver(_REPLY, _START, _interrupted(), _DONE)
+        await _until(lambda: detected == [False, True])
+        reply = session._current_generation
+        assert reply is not None
+        await _until(lambda: reply._done)
+        await asyncio.sleep(0.05)
+        assert seen.stops() == 0
+
+        socket.deliver(_END)
+        await _until(lambda: seen.stops() == 1)
+
+
+async def test_the_caller_speaking_to_a_silent_agent_is_a_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without it the session reads a caller mid-sentence as away and checks on them."""
+    socket = _ScriptedLiveSession()
+    async with _connected_session(monkeypatch, handle=None, sockets=[socket]) as (session, _):
+        seen = _Seen(session)
+        detected = _detected(session)
+        socket.deliver(_START)
+        await _until(lambda: detected == [True])
+        assert seen.stops() == 0
+
+        socket.deliver(_END)
+        await _until(lambda: seen.stops() == 1)
+
+    assert seen.events == ["input_speech_started", "input_speech_stopped"]
+
+
+@pytest.mark.parametrize("busy", ["reply_playing", "reply_requested"])
+async def test_voice_activity_does_not_barge_in_on_the_agent(
+    monkeypatch: pytest.MonkeyPatch, busy: str
+) -> None:
+    """Gemini decides a barge-in itself and says so with `server_content.interrupted`.
+
+    An `input_speech_started` stops the agent's playout; sent for every voice activity, it
     would cut the agent off over speech the service chose not to treat as one.
     """
     socket = _ScriptedLiveSession()
     async with _connected_session(monkeypatch, handle=None, sockets=[socket]) as (session, _):
         seen = _Seen(session)
-        socket.deliver(_START, _END, _START, _END, _REPLY, _DONE)
-        await _until(lambda: seen.stops() == 1)
+        detected = _detected(session)
+        if busy == "reply_playing":
+            socket.deliver(_REPLY)
+            await _until(lambda: len(seen.generations) == 1)
+        else:
+            session.generate_reply()
+        socket.deliver(_START, _END, _REPLY, _DONE)
+        await _until(lambda: _answered(session, seen))
 
-    # as for any reply the service starts: the playout stop ahead of it, the generation, and
-    # the stop once it is done
-    assert seen.events == ["input_speech_started", "generation_created", "input_speech_stopped"]
+    assert True not in detected
+
+
+async def test_the_agent_can_answer_once_the_callers_speech_ended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wired into an `AgentActivity`: the reply is let through at the end of speech.
+
+    Playout waits until the caller is silent, so this is what decides when the caller
+    hears the answer to a barge-in.
+    """
+    from livekit.agents import Agent, AgentSession
+    from livekit.agents.voice.agent_activity import AgentActivity
+
+    from .fake_realtime import FakeRealtimeModel
+
+    monkeypatch.setenv("LIVEKIT_API_KEY", "k")
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "s")
+    activity = AgentActivity(
+        Agent(instructions="test"), AgentSession(llm=FakeRealtimeModel(), vad=None)
+    )
+    socket = _ScriptedLiveSession()
+    async with _connected_session(monkeypatch, handle=None, sockets=[socket]) as (session, _):
+        session.on("input_speech_started", activity._on_input_speech_started)
+        session.on("input_speech_stopped", activity._on_input_speech_stopped)
+        socket.deliver(_REPLY, _DONE, _START, _interrupted(), _CALLER)
+        await _until(lambda: not activity._user_silence_event.is_set())
+
+        socket.deliver(_END, _REPLY_AGAIN)
+        await _until(lambda: session._current_generation.has_output)  # type: ignore[union-attr]
+        await _until(activity._user_silence_event.is_set, timeout=1.0)
+        assert not session._current_generation._done  # type: ignore[union-attr]
+        socket.deliver(_DONE)
+        await asyncio.sleep(0.05)
+
+    activity._reschedule_user_speech_release(False)
 
 
 # --- reconnects ---------------------------------------------------------------
@@ -1694,14 +1815,10 @@ async def test_voice_activity_leaves_the_turn_taking_alone(
 # The plugin replaces its connection on `go_away`, on an error and on an option change,
 # resuming through the last handle, and fresh from `reconnect()`.
 
-_INTERRUPTED = types.LiveServerMessage(server_content=types.LiveServerContent(interrupted=True))
 _CALLER_AGAIN = types.LiveServerMessage(
     server_content=types.LiveServerContent(
         input_transcription=types.Transcription(text="Wie geht's?")
     )
-)
-_REPLY_AGAIN = types.LiveServerMessage(
-    server_content=_audio_content(output_transcription=types.Transcription(text="Gut, danke."))
 )
 
 
@@ -1799,7 +1916,7 @@ async def test_a_barge_in_after_the_reply_finished_is_still_ended_after_a_reconn
         session.on("input_speech_started", lambda ev: detected.append(ev.speech_detected))
         reconnects: list[llm.RealtimeSessionReconnectedEvent] = []
         session.on("session_reconnected", reconnects.append)
-        first.deliver(_REPLY, _DONE, _INTERRUPTED)
+        first.deliver(_REPLY, _DONE, _interrupted())
         await _until(lambda: detected == [False, True])
 
         _reconnect(session, resume=True)
