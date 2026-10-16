@@ -5079,8 +5079,16 @@ class AgentActivity(RecognitionHooks):
                     and fnc_executed_ev.has_tool_reply
                 ):
                     # not awaited: the wait is the model's, and a speech that the next
-                    # generation interrupts is cancelled within seconds, its result with it
-                    self._send_tool_results_in_turn(_send)
+                    # generation interrupts is cancelled within seconds, its result with it.
+                    # A generation that started after the held result went out and called a
+                    # tool instead of answering it has moved on: the model says nothing until
+                    # this result arrives, so it cannot wait for the slot.
+                    self._send_tool_results_in_turn(
+                        _send,
+                        now=tool_result_reply_fut is not None
+                        and tool_result_reply_fut is self._tool_result_reply_fut
+                        and not tool_result_reply_fut.done(),
+                    )
                 else:
                     await _send()
 
@@ -5124,8 +5132,12 @@ class AgentActivity(RecognitionHooks):
                 "thinking" if self._background_speeches else "listening"
             )
 
-    def _send_tool_results_in_turn(self, send: Callable[[], Coroutine[Any, Any, None]]) -> None:
-        task = asyncio.create_task(self._send_tool_results_after_the_last_answer(send))
+    def _send_tool_results_in_turn(
+        self, send: Callable[[], Coroutine[Any, Any, None]], *, now: bool
+    ) -> None:
+        task = asyncio.create_task(
+            send() if now else self._send_tool_results_after_the_last_answer(send)
+        )
         self._tool_result_send_tasks.add(task)
         task.add_done_callback(self._tool_result_send_tasks.discard)
 
