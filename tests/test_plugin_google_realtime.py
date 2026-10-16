@@ -1727,10 +1727,10 @@ async def test_the_barged_in_reply_finishing_does_not_end_the_callers_speech(
         assert reply is not None
         await _until(lambda: reply._done)
         await asyncio.sleep(0.05)
-        assert seen.stops() == 0
+        assert seen.events[-1] == "input_speech_started"
 
         socket.deliver(_END)
-        await _until(lambda: seen.stops() == 1)
+        await _until(lambda: seen.events[-1] == "input_speech_stopped")
 
 
 async def test_the_caller_speaking_to_a_silent_agent_is_a_turn(
@@ -1749,6 +1749,32 @@ async def test_the_caller_speaking_to_a_silent_agent_is_a_turn(
         await _until(lambda: seen.stops() == 1)
 
     assert seen.events == ["input_speech_started", "input_speech_stopped"]
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [[_REPLY, _DONE], [_CALLER, _REPLY, _DONE], [_CALLER, _TOOL_CALL]],
+    ids=["reply", "transcript_then_reply", "tool_call"],
+)
+async def test_the_service_answering_the_caller_ends_their_speech(
+    monkeypatch: pytest.MonkeyPatch, messages: list[types.LiveServerMessage]
+) -> None:
+    """Should their ACTIVITY_END go missing, the answer ends the speech, once.
+
+    Without it the caller's speech stays open and every reply waits for the session's
+    unpaired-speech backstop.
+    """
+    socket = _ScriptedLiveSession()
+    async with _connected_session(monkeypatch, handle=None, sockets=[socket]) as (session, _):
+        seen = _Seen(session)
+        detected = _detected(session)
+        socket.deliver(_START, *messages)
+        await _until(lambda: _answered(session, seen))
+        await asyncio.sleep(0.05)
+
+    assert detected[0] is True
+    assert seen.stops() == 1
+    assert not session._caller_voice_active
 
 
 @pytest.mark.parametrize("busy", ["reply_playing", "reply_requested"])
@@ -1873,7 +1899,7 @@ async def test_no_turn_is_lost_or_doubled_across_a_reconnect(
         first.deliver(_CALLER, _REPLY, *([] if cut_mid_reply else [_DONE]))
         await _until(
             lambda: (
-                seen.stops() == (0 if cut_mid_reply else 1)
+                seen.stops() == 1
                 and session._current_generation is not None
                 and session._current_generation.has_output
             )
@@ -1912,8 +1938,7 @@ async def test_a_barge_in_after_the_reply_finished_is_still_ended_after_a_reconn
         _,
     ):
         seen = _Seen(session)
-        detected: list[bool] = []
-        session.on("input_speech_started", lambda ev: detected.append(ev.speech_detected))
+        detected = _detected(session)
         reconnects: list[llm.RealtimeSessionReconnectedEvent] = []
         session.on("session_reconnected", reconnects.append)
         first.deliver(_REPLY, _DONE, _interrupted())
