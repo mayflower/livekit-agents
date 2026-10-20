@@ -432,6 +432,8 @@ class AgentActivity(RecognitionHooks):
 
         self._current_speech: SpeechHandle | None = None
         self._speech_q: list[tuple[int, float, SpeechHandle]] = []
+        # speeches of responses the realtime provider started on its own
+        self._server_generation_speeches: weakref.WeakSet[SpeechHandle] = weakref.WeakSet()
         self._user_silence_event: asyncio.Event = asyncio.Event()
         self._user_silence_event.set()
         # whether the open input-speech event was a detected caller turn, so the
@@ -2576,6 +2578,7 @@ class AgentActivity(RecognitionHooks):
             SpeechCreatedEvent(speech_handle=handle, user_initiated=False, source="generate_reply"),
         )
 
+        self._server_generation_speeches.add(handle)
         tool_result_reply_fut = self._tool_result_reply_fut
         if self._tool_result_reply_started is not None:
             self._tool_result_reply_started.set()
@@ -4316,6 +4319,26 @@ class AgentActivity(RecognitionHooks):
             self._session._unanswered_user_metrics = None
 
     @utils.log_exceptions(logger=logger)
+    async def _wait_for_reply_authorization(self, speech_handle: SpeechHandle) -> bool:
+        """Wait for the scheduler's turn and a silent caller. False if interrupted meanwhile."""
+        authorization_tasks: list[asyncio.Future[Any]] = [
+            asyncio.ensure_future(speech_handle._wait_for_authorization()),
+            asyncio.ensure_future(self._authorization_allowed.wait()),
+        ]
+        if speech_handle.allow_interruptions and not self._rt_overlapping_speech_enabled:
+            authorization_tasks.append(asyncio.ensure_future(self._user_silence_event.wait()))
+        await speech_handle.wait_if_not_interrupted(authorization_tasks)
+        if speech_handle.interrupted:
+            await utils.aio.cancel_and_wait(*authorization_tasks)
+            return False
+        return True
+
+    def _server_generation_queued(self) -> bool:
+        return any(
+            speech in self._server_generation_speeches and not speech.done()
+            for _, _, speech in self._speech_q
+        )
+
     async def _realtime_reply_task(
         self,
         *,
@@ -4329,16 +4352,8 @@ class AgentActivity(RecognitionHooks):
     ) -> None:
         assert self._rt_session is not None, "rt_session is not available"
         # realtime_reply_task is called only when there's text input, native audio input is handled by _realtime_generation_task
-        authorization_tasks: list[asyncio.Future[Any]] = [
-            asyncio.ensure_future(speech_handle._wait_for_authorization()),
-            asyncio.ensure_future(self._authorization_allowed.wait()),
-        ]
-        if speech_handle.allow_interruptions and not self._rt_overlapping_speech_enabled:
-            authorization_tasks.append(asyncio.ensure_future(self._user_silence_event.wait()))
-        await speech_handle.wait_if_not_interrupted(authorization_tasks)
         # the queue wait is recorded by _realtime_generation_task, which owns the agent_turn span
-        if speech_handle.interrupted:
-            await utils.aio.cancel_and_wait(*authorization_tasks)
+        if not await self._wait_for_reply_authorization(speech_handle):
             return
 
         if text is not None:
@@ -4410,6 +4425,24 @@ class AgentActivity(RecognitionHooks):
             # Waiting for the slot costs less than the round-trip that refusal
             # costs, and stays interruptible: a caller who speaks in the
             # meantime should still cut this reply off.
+            #
+            # When the response holding the slot is one the provider started on its own
+            # (OpenAI's server VAD, as the caller stops speaking), its speech is queued
+            # behind this reply. Playout follows the queue, so the reply generated second
+            # would be heard first. It goes back into the queue behind that speech instead.
+            while self._rt_session.has_active_generation and self._server_generation_queued():
+                logger.debug(
+                    "reply yields its turn to the provider's own response",
+                    extra={"speech_id": speech_handle.id},
+                )
+                speech_handle._clear_authorization()
+                speech_handle._mark_generation_done()
+                self._schedule_speech(
+                    speech_handle, SpeechHandle.SPEECH_PRIORITY_NORMAL, force=True
+                )
+                if not await self._wait_for_reply_authorization(speech_handle):
+                    return
+
             if not speech_handle.interrupted:
                 slot = asyncio.ensure_future(self._rt_session.wait_for_response_slot())
                 await speech_handle.wait_if_not_interrupted([slot])
