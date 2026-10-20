@@ -56,6 +56,10 @@ class _FakeActivity(SimpleNamespace):
             ),
             _realtime_generation_task=_realtime_generation_task,
             generation_calls=generation_calls,
+            _server_generation_queued=lambda: False,
+        )
+        self._wait_for_reply_authorization = lambda speech_handle: (
+            AgentActivity._wait_for_reply_authorization(cast(AgentActivity, self), speech_handle)
         )
 
 
